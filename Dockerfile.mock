@@ -1,0 +1,10 @@
+FROM golang:1.25-alpine
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN go build -o /app/mock-server ./tests/mock-server
+EXPOSE 17007 18181
+HEALTHCHECK --interval=2s --timeout=5s --retries=15 \
+  CMD wget -qO- http://localhost:17007/health || exit 1
+CMD ["/app/mock-server"]

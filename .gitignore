@@ -1,0 +1,22 @@
+# Compiled binaries
+/msg
+/internal/openmessage/om-server
+
+# Logs
+panic_log.txt
+/internal/openmessage/server.log
+*.log
+
+# Signal data (credentials, account keys — never commit these)
+/internal/signal-data/
+
+# Claude Code local settings
+.claude/
+
+# Go test cache and cover output
+*.test
+*.out
+coverage.html
+
+# macOS
+.DS_Store

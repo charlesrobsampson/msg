@@ -1,0 +1,3 @@
+[submodule "internal/openmessage"]
+	path = internal/openmessage
+	url = https://github.com/MaxGhenis/openmessage.git

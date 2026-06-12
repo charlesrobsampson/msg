@@ -1,0 +1,88 @@
+# Install task runner: brew install go-task
+# Docs: https://taskfile.dev
+version: '3'
+
+vars:
+  BINARY: ./msg
+
+tasks:
+  default:
+    desc: List available tasks
+    silent: true
+    cmds:
+      - task --list
+
+  build:
+    desc: Build the msg CLI binary
+    cmds:
+      - go build -o {{.BINARY}} ./cmd/msg
+
+  test:
+    desc: Run end-to-end tests (in-process mocks — no external services required)
+    cmds:
+      - go test ./tests/e2e/... -count=1 -timeout 90s
+
+  test:verbose:
+    desc: Run e2e tests with verbose output
+    cmds:
+      - go test ./tests/e2e/... -v -count=1 -timeout 90s
+
+  test:run:
+    desc: "Run a single test by name  (e.g.: task test:run -- TestList)"
+    cmds:
+      - go test ./tests/e2e/... -v -count=1 -run '{{.CLI_ARGS}}' -timeout 90s
+
+  mock:
+    desc: Start mock servers (OpenMessage :17007, Signal :18181) for manual msg exploration
+    cmds:
+      - go run ./tests/mock-server
+
+  install:
+    desc: Install msg to GOPATH/bin
+    cmds:
+      - go install ./cmd/msg
+
+  clean:
+    desc: Remove built binaries
+    cmds:
+      - rm -f {{.BINARY}}
+
+  vet:
+    desc: Run go vet across all packages
+    cmds:
+      - go vet ./...
+
+  fmt:
+    desc: Format all Go source files
+    cmds:
+      - gofmt -w .
+
+  tidy:
+    desc: Tidy Go module dependencies
+    cmds:
+      - go mod tidy
+
+  test:coverage:
+    desc: Run e2e tests with coverage and open the HTML report
+    cmds:
+      - go test ./tests/e2e/... -count=1 -timeout 90s -coverprofile=coverage.out ./...
+      - go tool cover -html=coverage.out -o coverage.html
+      - open coverage.html
+
+  check:
+    desc: Vet + test (good pre-push gate)
+    cmds:
+      - task: vet
+      - task: test
+
+  docker:test:
+    desc: Run the full e2e test suite inside Docker (requires only Docker, no local Go)
+    cmds:
+      - docker compose -f docker-compose.test.yml up --build --abort-on-container-exit --exit-code-from test-runner
+      - docker compose -f docker-compose.test.yml down
+
+  docker:mock:
+    desc: Run mock servers in Docker for manual exploration without a local Go toolchain
+    cmds:
+      - docker build -f Dockerfile.mock -t msg-mock-server .
+      - docker run --rm -p 17007:17007 -p 18181:18181 msg-mock-server

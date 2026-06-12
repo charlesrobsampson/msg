@@ -1,0 +1,9 @@
+services:
+  openmessage:
+    build: .
+    container_name: openmessage-server
+    ports:
+      - "7007:7007"
+    volumes:
+      - ~/.local/share/openmessage:/root/.local/share/openmessage
+    restart: unless-stopped

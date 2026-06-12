@@ -1,0 +1,8 @@
+services:
+  test-runner:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    environment:
+      MSG_SKIP_STARTUP: "true"
+      SIGNAL_ACCOUNT: "+15550001111"
