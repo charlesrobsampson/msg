@@ -442,6 +442,44 @@ func main() {
 	}
 }
 
+// omServerBinaryPath returns the canonical location of the om-server binary:
+// ~/.config/msg/om-server. This is install-location-independent.
+func omServerBinaryPath() (string, error) {
+	dir, err := client.ConfigDirPath()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "om-server"), nil
+}
+
+// buildOmServer tries to compile om-server from the submodule source into
+// the canonical config-dir location. Only works when run from the repo root.
+// Returns the binary path on success.
+func buildOmServer() (string, error) {
+	destPath, err := omServerBinaryPath()
+	if err != nil {
+		return "", err
+	}
+
+	// Source is only present when running from the cloned repo root.
+	srcDir := filepath.Join("internal", "openmessage")
+	if _, err := os.Stat(srcDir); os.IsNotExist(err) {
+		return "", fmt.Errorf("source not found at %s — run 'msg server start' from the cloned repository root once to build it", srcDir)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+		return "", err
+	}
+
+	build := exec.Command("go", "build", "-o", destPath, ".")
+	build.Dir = srcDir
+	if out, err := build.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("build failed: %v\n%s", err, out)
+	}
+	os.Chmod(destPath, 0755)
+	return destPath, nil
+}
+
 // ensureServerRunning starts the OpenMessage server if not already running.
 // It is intentionally silent — callers that want output must print their own messages.
 func ensureServerRunning() {
@@ -458,19 +496,24 @@ func ensureServerRunning() {
 		return
 	}
 
-	serverDir := filepath.Join("internal", "openmessage")
-	binaryPath := filepath.Join(serverDir, "om-server")
-
-	if _, err := os.Stat(binaryPath); os.IsNotExist(err) {
-		build := exec.Command("go", "build", "-o", "om-server", ".")
-		build.Dir = serverDir
-		if _, err := build.CombinedOutput(); err != nil {
-			return
-		}
-		os.Chmod(binaryPath, 0755)
+	binaryPath, err := omServerBinaryPath()
+	if err != nil {
+		return
 	}
 
-	logPath := filepath.Join(serverDir, "server.log")
+	// Build into the config dir if not already present.
+	if _, err := os.Stat(binaryPath); os.IsNotExist(err) {
+		if built, err := buildOmServer(); err != nil {
+			fmt.Println("Error: om-server not found and could not be built.")
+			fmt.Println("  Run 'msg server start' once from the cloned repository root to compile it.")
+			return
+		} else {
+			binaryPath = built
+		}
+	}
+
+	cfgDir, _ := client.ConfigDirPath()
+	logPath := filepath.Join(cfgDir, "om-server.log")
 	cmd := exec.Command("/bin/sh", "-c", fmt.Sprintf("PORT=%d OPENMESSAGES_HOST=0.0.0.0 nohup %s serve > %s 2>&1 &", port, binaryPath, logPath))
 	if err := cmd.Start(); err != nil {
 		return
@@ -487,8 +530,8 @@ func ensureServerRunning() {
 }
 
 // ensureSignalRunning starts the Signal CLI container if not already running.
-// It is intentionally silent — callers that want output must print their own messages.
-func ensureSignalRunning(port int) {
+// Returns true if the server is reachable after the call.
+func ensureSignalRunning(port int) bool {
 	if port == 0 {
 		port = 18081
 	}
@@ -496,27 +539,41 @@ func ensureSignalRunning(port int) {
 	addr := fmt.Sprintf("localhost:%d", port)
 	if conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond); err == nil {
 		conn.Close()
-		return
+		return true
 	}
 
 	home, _ := os.UserHomeDir()
 	composePath := filepath.Join(home, ".config", "msg", "docker-compose-signal.yml")
 	if _, err := os.Stat(composePath); os.IsNotExist(err) {
-		return
+		if err := writeSignalSetupFiles(); err != nil {
+			fmt.Printf("Error: Signal setup files missing and could not be created: %v\n", err)
+			return false
+		}
+		fmt.Println("Signal setup files written to ~/.config/msg/")
+		fmt.Println("Building Signal container (this takes ~2 minutes on first run)...")
+		build := exec.Command("docker", "compose", "-f", composePath, "build")
+		build.Stdout = os.Stdout
+		build.Stderr = os.Stderr
+		if err := build.Run(); err != nil {
+			fmt.Printf("Error building Signal container: %v\n", err)
+			return false
+		}
 	}
 
 	cmd := exec.Command("docker", "compose", "-f", composePath, "up", "-d")
 	if err := cmd.Run(); err != nil {
-		return
+		fmt.Printf("Error starting Signal container: %v\n", err)
+		return false
 	}
 
 	for range 20 {
 		time.Sleep(500 * time.Millisecond)
 		if conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond); err == nil {
 			conn.Close()
-			return
+			return true
 		}
 	}
+	return false
 }
 
 // ensureSignalReceiverRunning starts the msg signal-receiver process if not already running.
@@ -567,11 +624,14 @@ func serverStart(cfg client.Config, hasOpenMessage bool, signalSettings *client.
 	}
 	if signalSettings != nil {
 		fmt.Printf("Starting Signal server (port %d)...\n", signalSettings.Port)
-		ensureSignalRunning(signalSettings.Port)
-		fmt.Println("Signal server ready.")
-		fmt.Println("Starting Signal message receiver...")
-		ensureSignalReceiverRunning()
-		fmt.Println("Signal receiver ready.")
+		if ensureSignalRunning(signalSettings.Port) {
+			fmt.Println("Signal server ready.")
+			fmt.Println("Starting Signal message receiver...")
+			ensureSignalReceiverRunning()
+			fmt.Println("Signal receiver ready.")
+		} else {
+			fmt.Println("Signal server did not start. Run 'msg server status' to check.")
+		}
 	}
 	fmt.Println("All services started.")
 }
@@ -1039,6 +1099,12 @@ func handleProviderToggle(provider string, enable bool) {
 		if key == "sms" {
 			fmt.Println("Run 'msg pair google' to register Google Messages.")
 		} else if key == "signal" {
+			if err := writeSignalSetupFiles(); err != nil {
+				fmt.Printf("Warning: could not write Signal setup files: %v\n", err)
+			} else {
+				fmt.Println("Signal setup files written to ~/.config/msg/")
+				fmt.Println("Build the container:  docker compose -f ~/.config/msg/docker-compose-signal.yml build")
+			}
 			fmt.Println("Run 'msg link signal' to link a Signal device.")
 		}
 	} else {
@@ -1139,8 +1205,11 @@ func handlePairProvider(provider string) {
 		return
 	}
 
-	serverDir := filepath.Join("internal", "openmessage")
-	binaryPath := filepath.Join(serverDir, "om-server")
+	binaryPath, err := omServerBinaryPath()
+	if err != nil {
+		fmt.Printf("Error resolving om-server path: %v\n", err)
+		return
+	}
 	if _, err := os.Stat(binaryPath); os.IsNotExist(err) {
 		fmt.Println("Error: om-server binary not found. Run 'msg server start' first to build it.")
 		return
@@ -1233,6 +1302,13 @@ func handleRead(id string, limit int, leaveUnread bool, beforeTS int64, beforeID
 		}
 		t := time.UnixMilli(m.TimestampMS).Format("01/02 03:04 PM")
 		fmt.Printf("[%s - %s]: %s\n", t, sender, body)
+		for _, att := range m.Attachments {
+			label := att.MimeType
+			if label == "" {
+				label = "attachment"
+			}
+			fmt.Printf("    📎 %s\n", label)
+		}
 	}
 
 	if !leaveUnread {

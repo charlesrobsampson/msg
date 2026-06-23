@@ -62,8 +62,8 @@ The `port` field is optional (defaults to `7007`). Override with the `OPENMESSAG
 | Path | Purpose |
 |---|---|
 | `internal/openmessage/` | openmessage server source (git submodule — do not edit) |
-| `internal/openmessage/om-server` | compiled binary (built on first `msg server start`) |
-| `internal/openmessage/server.log` | server log output |
+| `~/.config/msg/om-server` | compiled binary (built on first `msg server start` from repo root) |
+| `~/.config/msg/om-server.log` | server log output |
 
 ## Common operations
 
@@ -85,4 +85,4 @@ Google Messages sessions expire periodically. When `msg provider status` shows `
 
 ## Background
 
-openmessage implements the Google Messages for Web protocol to expose a local REST API. `msg` talks to this API to fetch conversations and send messages. The server binary is compiled from the submodule source at `internal/openmessage/` on first run.
+openmessage implements the Google Messages for Web protocol to expose a local REST API. `msg` talks to this API to fetch conversations and send messages. On first `msg server start`, the binary is compiled from the submodule source at `internal/openmessage/` and placed in `~/.config/msg/om-server`, so subsequent runs work from any directory (including the installed binary in `~/go/bin/msg`).

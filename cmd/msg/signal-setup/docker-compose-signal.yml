@@ -1,0 +1,18 @@
+services:
+  signal-api:
+    build:
+      context: ${HOME}/.config/msg
+      dockerfile: Dockerfile.signal-patched
+    image: signal-cli-patched
+    container_name: signal-manager
+    environment:
+      - MODE=json-rpc
+      - PORT=8080
+      - RECEIVE_WEBHOOK_URL=http://host.docker.internal:7008/api/signal/webhook
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "18081:8080"
+    volumes:
+      - ${HOME}/.config/msg/signal-data:/home/.local/share/signal-cli
+    restart: unless-stopped

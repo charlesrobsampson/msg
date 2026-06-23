@@ -1,0 +1,83 @@
+# Stage 1: extract the existing signal-cli lib JARs from the base image.
+FROM bbernhard/signal-cli-rest-api:0.202-dev AS base
+USER root
+RUN SDIR=$(ls /opt/ | grep signal-cli | head -1) && \
+    echo "signal-cli dir: $SDIR" && \
+    cp -r /opt/$SDIR/lib /signal-cli-lib
+
+# Stage 2: compile only the patched class and inject it back.
+# All downloads come from github.com — no Maven Central needed.
+FROM gradle:8-jdk17 AS patcher
+WORKDIR /patch
+
+# Copy the existing signal-cli JARs (zero network traffic).
+COPY --from=base /signal-cli-lib/ /patch/signal-cli-lib/
+
+# Diagnostics: list every JAR and find which one contains the target class.
+RUN echo "=== All JARs ===" && ls /patch/signal-cli-lib/ && \
+    echo "=== Searching for SignalServiceMetadataProtobufSerializer ===" && \
+    find /patch/signal-cli-lib -name "*.jar" | while read jar; do \
+        jar tf "$jar" 2>/dev/null | grep -q "SignalServiceMetadataProtobufSerializer" && echo "FOUND: $jar"; \
+    done; \
+    echo "=== Kotlin stdlib version ===" && \
+    find /patch/signal-cli-lib -name "kotlin-stdlib-*.jar"
+
+# Auto-detect the Kotlin version in use and download the matching standalone
+# compiler from GitHub (Docker can reach github.com).
+RUN KVER=$(find /patch/signal-cli-lib -name "kotlin-stdlib-*.jar" | \
+        grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -1) && \
+    [ -n "$KVER" ] || KVER="2.1.0" && \
+    echo "Detected Kotlin $KVER — downloading kotlinc..." && \
+    curl -fL -o /tmp/kotlinc.zip \
+        "https://github.com/JetBrains/kotlin/releases/download/v${KVER}/kotlin-compiler-${KVER}.zip" && \
+    unzip -q /tmp/kotlinc.zip -d /opt/ && \
+    /opt/kotlinc/bin/kotlinc -version
+
+# Clone Turasa and apply two patches:
+#  1. serverGuid null-safe fix  (the NPE we're fixing)
+#  2. metadata.address!!        (avoids cross-module smart-cast compile error
+#                                when compiling a single file outside Gradle)
+RUN git clone https://github.com/Turasa/libsignal-service-java.git turasa && \
+    cd turasa && git checkout v2.15.3_unofficial_147
+RUN SERIALIZER=$(find /patch/turasa -name "SignalServiceMetadataProtobufSerializer.kt" | head -1) && \
+    [ -n "$SERIALIZER" ] || (echo "ERROR: serializer file not found" && exit 1) && \
+    echo "Patching: $SERIALIZER" && \
+    sed -i 's/\.serverGuid(metadata\.serverGuid)/.serverGuid(metadata.serverGuid ?: "")/' "$SERIALIZER" && \
+    sed -i 's/fromProtobuf(metadata\.address)/fromProtobuf(metadata.address!!)/' "$SERIALIZER" && \
+    echo "Patches applied:" && grep -n "serverGuid\|address" "$SERIALIZER"
+
+# Compile only the patched file using the installed signal-cli JARs as classpath.
+RUN SERIALIZER=$(find /patch/turasa -name "SignalServiceMetadataProtobufSerializer.kt" | head -1) && \
+    mkdir -p /tmp/patch-classes && \
+    /opt/kotlinc/bin/kotlinc \
+        -classpath "$(find /patch/signal-cli-lib -name '*.jar' | tr '\n' ':')" \
+        "$SERIALIZER" \
+        -d /tmp/patch-classes && \
+    echo "Compiled:" && find /tmp/patch-classes -name "*.class"
+
+# Find which JAR contains the class and inject the patched version.
+RUN TJAR=$(find /patch/signal-cli-lib -name "*.jar" | while read jar; do \
+        jar tf "$jar" 2>/dev/null | grep -q "SignalServiceMetadataProtobufSerializer" && \
+            echo "$jar" && break; \
+    done) && \
+    if [ -z "$TJAR" ]; then \
+        echo "WARNING: class not found in any JAR — signal-cli may have already fixed this"; \
+    else \
+        echo "Patching: $TJAR" && \
+        cd /tmp/patch-classes && \
+        CLASSES=$(find . -name "SignalServiceMetadataProtobufSerializer*.class" | sed 's|^\./||') && \
+        echo "Injecting: $CLASSES" && \
+        jar uf "$TJAR" $CLASSES && \
+        echo "Verified:" && jar tf "$TJAR" | grep Serializer; \
+    fi
+
+# Final image: replace all signal-cli lib JARs with our (potentially patched) set.
+FROM bbernhard/signal-cli-rest-api:0.202-dev
+USER root
+COPY --from=patcher /patch/signal-cli-lib/ /tmp/patched-lib/
+RUN SDIR=$(ls /opt/ | grep signal-cli | head -1) && \
+    echo "Replacing JARs in /opt/$SDIR/lib/" && \
+    cp /tmp/patched-lib/*.jar /opt/$SDIR/lib/ && \
+    rm -rf /tmp/patched-lib
+# Do NOT set USER here — the bbernhard entrypoint runs as root to call
+# groupmod/usermod, then drops to the signal-api user itself.

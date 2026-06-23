@@ -140,8 +140,10 @@ func (p *OpenMessageProvider) FetchMessages(conversationID string, limit int, be
 			TimestampMS: r.TimestampMS,
 		}
 		if r.MediaID != "" {
+			url := fmt.Sprintf("%s/api/media/%s", p.baseURL, r.MessageID)
 			messages[i].MimeType = r.MimeType
-			messages[i].AttachmentURL = fmt.Sprintf("%s/api/media/%s", p.baseURL, r.MessageID)
+			messages[i].AttachmentURL = url
+			messages[i].Attachments = []Attachment{{URL: url, MimeType: r.MimeType}}
 		}
 		if r.Reactions != "" {
 			// openmessage stores reactions as [{"emoji":"😂","count":2}] — no senders.

@@ -13,7 +13,15 @@
 
 The config files live in `~/.config/msg/`.
 
-**1. Register or link a device**
+**1. Enable the provider**
+
+```bash
+msg provider enable signal
+```
+
+This writes `~/.config/msg/Dockerfile.signal-patched` and `~/.config/msg/docker-compose-signal.yml` if they don't exist yet.
+
+**2. Register or link a device**
 
 Start the unpatched image temporarily to register:
 
@@ -30,7 +38,7 @@ mkdir -p ~/.config/msg/signal-data
 # copy your accounts.json and account subdirectories here
 ```
 
-**2. Configure msg**
+**3. Configure msg**
 
 Add a Signal provider to `~/.config/msg/config.json`:
 
@@ -48,7 +56,7 @@ Add a Signal provider to `~/.config/msg/config.json`:
 }
 ```
 
-**3. Build and run the patched image**
+**4. Build and run the patched image**
 
 Signal's server periodically changes its envelope format in ways that break signal-cli. The patched image applies a null-safety fix to `SignalServiceMetadataProtobufSerializer` so messages aren't silently dropped (see [Background](#background) below).
 
@@ -60,7 +68,7 @@ docker compose -f ~/.config/msg/docker-compose-signal.yml up -d
 
 The build takes about 2 minutes. It only needs GitHub access — no Maven Central required.
 
-**4. Start the receiver**
+**5. Start the receiver**
 
 The receiver listens for incoming webhooks and maintains the WebSocket subscription that activates message delivery:
 
