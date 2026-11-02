@@ -27,11 +27,24 @@ func OpenSignalDBForProfile(profile string) (*SignalDB, error) {
 	if profile != "" {
 		dbName = "signal-cache-" + profile + ".db"
 	}
-	dbPath := filepath.Join(home, ".config", "msg", dbName)
+	return OpenSignalDBAt(filepath.Join(home, ".config", "msg", dbName))
+}
 
-	os.MkdirAll(filepath.Dir(dbPath), 0755)
+// OpenSignalDBAt opens (and initializes) the signal cache DB at path. It is the
+// seam that lets library callers such as Aether keep test and runtime state out
+// of $HOME. An empty path falls back to OpenSignalDB.
+func OpenSignalDBAt(path string) (*SignalDB, error) {
+	if path == "" {
+		return OpenSignalDB()
+	}
 
-	db, err := sql.Open("sqlite", dbPath)
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return nil, fmt.Errorf("failed to create signal cache db dir: %v", err)
+		}
+	}
+
+	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open signal cache db: %v", err)
 	}

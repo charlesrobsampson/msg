@@ -45,6 +45,12 @@ type SignalSendRequest struct {
 }
 
 func NewSignalProvider(id string, cfg ProviderSettings, account string) *SignalProvider {
+	return NewSignalProviderWithDB(id, cfg, account, "")
+}
+
+// NewSignalProviderWithDB builds a signal provider backed by the cache DB at
+// dbPath. An empty dbPath keeps the existing default-profile behavior.
+func NewSignalProviderWithDB(id string, cfg ProviderSettings, account string, dbPath string) *SignalProvider {
 	port := cfg.Port
 	if port == 0 {
 		port = 18081
@@ -65,7 +71,12 @@ func NewSignalProvider(id string, cfg ProviderSettings, account string) *SignalP
 		account = os.Getenv("SIGNAL_ACCOUNT")
 	}
 
-	db, _ := OpenSignalDB()
+	var db *SignalDB
+	if dbPath == "" {
+		db, _ = OpenSignalDB()
+	} else {
+		db, _ = OpenSignalDBAt(dbPath)
+	}
 
 	return &SignalProvider{
 		id:      id,
