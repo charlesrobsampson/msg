@@ -415,7 +415,7 @@ func main() {
 		handlePairProvider(os.Args[2])
 
 	case "signal-receiver", "receive":
-		handleSignalReceiver()
+		handleSignalReceiver(os.Args[2:])
 
 	case "server":
 		if hasHelpFlag(os.Args[2:]) {

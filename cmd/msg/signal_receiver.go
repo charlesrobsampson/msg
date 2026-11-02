@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
@@ -42,11 +43,11 @@ type SignalWebhookEnvelope struct {
 	SourceUUID   string `json:"sourceUuid"`
 	SourceName   string `json:"sourceName"`
 	Timestamp    int64  `json:"timestamp"`
-	DataMessage *struct {
-		Message         string                  `json:"message"`
-		Timestamp       int64                   `json:"timestamp"`
-		Attachments     []signalAttachment      `json:"attachments"`
-		ReactionMessage *signalReactionMessage  `json:"reaction"`
+	DataMessage  *struct {
+		Message         string                 `json:"message"`
+		Timestamp       int64                  `json:"timestamp"`
+		Attachments     []signalAttachment     `json:"attachments"`
+		ReactionMessage *signalReactionMessage `json:"reaction"`
 		GroupInfo       *struct {
 			GroupID string `json:"groupId"`
 		} `json:"groupInfo"`
@@ -67,14 +68,14 @@ type SignalWebhookEnvelope struct {
 
 type SignalWebhookPayload struct {
 	Envelope SignalWebhookEnvelope `json:"envelope"`
-	Account  string               `json:"account"`
+	Account  string                `json:"account"`
 }
 
 // SignalJSONRPCWrapper handles the json-rpc mode webhook format:
 // {"jsonrpc":"2.0","method":"receive","params":{<SignalWebhookPayload>}}
 type SignalJSONRPCWrapper struct {
-	JSONRPC string               `json:"jsonrpc"`
-	Method  string               `json:"method"`
+	JSONRPC string                `json:"jsonrpc"`
+	Method  string                `json:"method"`
 	Params  *SignalWebhookPayload `json:"params"`
 }
 
@@ -83,6 +84,11 @@ var (
 	dbCacheMu sync.Mutex
 	dbByAcct  = make(map[string]*client.SignalDB)
 )
+
+// inboundForwarder is configured once when the receiver starts. It stays
+// disabled (the existing local-only behaviour) unless --forward or
+// MSG_FORWARD_URL is supplied.
+var inboundForwarder = NewForwarder("", "")
 
 func dbForAccount(account string) *client.SignalDB {
 	dbCacheMu.Lock()
@@ -104,7 +110,12 @@ func dbForAccount(account string) *client.SignalDB {
 	return db
 }
 
-func handleSignalReceiver() {
+func handleSignalReceiver(args []string) {
+	inboundForwarder = newForwarderFromArgs(args, os.Getenv)
+	if inboundForwarder.Enabled() {
+		fmt.Printf("[receiver] forwarding inbound messages to %s\n", inboundForwarder.URL)
+	}
+
 	port := 7008
 	if envPort := os.Getenv("MSG_SIGNAL_RECEIVER_PORT"); envPort != "" {
 		if p, err := strconv.Atoi(envPort); err == nil {
@@ -228,6 +239,7 @@ func saveSignalPayload(p SignalWebhookPayload) {
 	var msg client.Message
 	var convID string
 	var attachments []client.RawAttachment
+	var inbound *ForwardMessage
 
 	// Reaction messages update an existing message — they don't create a new unread.
 	// Use UpdateReactionInAllDBs so profiles whose config has no Account field
@@ -285,6 +297,16 @@ func saveSignalPayload(p SignalWebhookPayload) {
 			IsFromMe:     false,
 			TimestampMS:  ts,
 		}
+
+		inbound = &ForwardMessage{
+			Sender:    source,
+			Text:      p.Envelope.DataMessage.Message,
+			Provider:  "signal",
+			MessageID: msg.MessageID,
+		}
+		if p.Envelope.DataMessage.GroupInfo != nil && p.Envelope.DataMessage.GroupInfo.GroupID != "" {
+			inbound.GroupID = normalizeGroupID(p.Envelope.DataMessage.GroupInfo.GroupID)
+		}
 	} else if p.Envelope.SyncMessage != nil && p.Envelope.SyncMessage.SentMessage != nil {
 		sent := p.Envelope.SyncMessage.SentMessage
 
@@ -337,6 +359,12 @@ func saveSignalPayload(p SignalWebhookPayload) {
 			typeStr = "sync-sent"
 		}
 		fmt.Printf("[receiver] saved %s message for conv %s (account %s)\n", typeStr, convID, p.Account)
+	}
+
+	// Forward only after the DB write. Forward is best-effort: it logs its own
+	// retries/give-up and never changes the receiver's success path.
+	if inbound != nil && strings.TrimSpace(inbound.Sender) != "" && strings.TrimSpace(inbound.Text) != "" {
+		_ = inboundForwarder.Forward(context.Background(), *inbound)
 	}
 }
 
