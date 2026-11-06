@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/charlesrobsampson/msg/client"
@@ -21,6 +23,9 @@ const (
 	defaultForwardBaseDelay = 200 * time.Millisecond
 	maxForwardDelay         = 30 * time.Second
 	forwardHTTPTimeout      = 5 * time.Second
+	// defaultForwardQueueDepth bounds one profile's pending forwards. A full
+	// queue drops the newest message instead of blocking ingestion (A03).
+	defaultForwardQueueDepth = 64
 )
 
 // ForwardMessage is the normalized inbound envelope POSTed to Aether's
@@ -61,12 +66,22 @@ func NewForwarder(url, token string) *Forwarder {
 	}
 }
 
-// forwardInbound posts one normalized message to Aether when the sending
-// account's profile has opted in. The config is re-read for every message so
-// forwarding can be toggled without restarting the receiver. Config errors and
-// an enabled-but-empty URL are treated as "disabled for this message"; they are
-// logged and never fail ingestion. Forward logs its own delivery failures.
+// inboundForwards is the receiver-wide, bounded per-account forward queue. It
+// is enqueued after the DB write, so the webhook ACK never waits on Aether.
+var inboundForwards = NewForwardQueue(defaultForwardQueueDepth)
+
+// forwardInbound hands one normalized message to the sending account's
+// per-profile worker when that profile has opted in. The config is re-read for
+// every message so forwarding can be toggled without restarting the receiver.
+// Config errors and an enabled-but-empty URL are treated as "disabled for this
+// message"; they are logged and never fail ingestion. Enqueue never blocks: a
+// full queue drops the newest message and counts it.
 func forwardInbound(ctx context.Context, account string, msg ForwardMessage) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return
+		}
+	}
 	target, err := client.ForwardingForAccount(account)
 	if err != nil {
 		fmt.Printf("[receiver] forwarding config for account %s: %v\n", account, err)
@@ -81,8 +96,112 @@ func forwardInbound(ctx context.Context, account string, msg ForwardMessage) {
 		return
 	}
 
-	forwarder := NewForwarder(url, os.Getenv("AETHER_INGRESS_TOKEN"))
-	_ = forwarder.Forward(ctx, msg)
+	inboundForwards.Enqueue(account, url, os.Getenv("AETHER_INGRESS_TOKEN"), msg)
+}
+
+// forwardJob is one queued delivery. The URL and token are resolved at enqueue
+// time so a config toggle affects subsequent messages only.
+type forwardJob struct {
+	url   string
+	token string
+	msg   ForwardMessage
+}
+
+type forwardWorker struct {
+	jobs chan forwardJob
+}
+
+// ForwardQueue is a bounded queue with one worker per account (and therefore
+// per profile), which preserves per-profile forward order. Enqueue never
+// blocks; a saturated queue drops the newest job and increments Dropped.
+type ForwardQueue struct {
+	depth        int
+	newForwarder func(url, token string) *Forwarder
+	logf         func(format string, args ...any)
+
+	mu      sync.Mutex
+	workers map[string]*forwardWorker
+	closed  bool
+	wg      sync.WaitGroup
+	dropped atomic.Uint64
+}
+
+// NewForwardQueue returns a queue with the given per-profile depth. A
+// non-positive depth selects the default (64).
+func NewForwardQueue(depth int) *ForwardQueue {
+	if depth <= 0 {
+		depth = defaultForwardQueueDepth
+	}
+	return &ForwardQueue{
+		depth:        depth,
+		newForwarder: NewForwarder,
+		logf: func(format string, args ...any) {
+			fmt.Printf("[forward] "+format+"\n", args...)
+		},
+		workers: make(map[string]*forwardWorker),
+	}
+}
+
+// Enqueue offers one job without blocking. It returns false when the profile's
+// buffer is full or the queue is closed.
+func (q *ForwardQueue) Enqueue(account, url, token string, msg ForwardMessage) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	if q.closed {
+		q.dropped.Add(1)
+		q.logf("forward queue closed for account %s; dropping message %s", account, msg.MessageID)
+		return false
+	}
+
+	worker := q.workers[account]
+	if worker == nil {
+		worker = &forwardWorker{jobs: make(chan forwardJob, q.depth)}
+		q.workers[account] = worker
+		q.wg.Add(1)
+		go q.run(worker)
+	}
+
+	select {
+	case worker.jobs <- forwardJob{url: url, token: token, msg: msg}:
+		return true
+	default:
+		q.dropped.Add(1)
+		q.logf("forward queue full for account %s; dropping message %s", account, msg.MessageID)
+		return false
+	}
+}
+
+// Dropped reports how many forwards were dropped without an attempt.
+func (q *ForwardQueue) Dropped() uint64 {
+	return q.dropped.Load()
+}
+
+// Close stops accepting jobs and waits for in-flight and buffered forwards to
+// finish. It is idempotent.
+func (q *ForwardQueue) Close() {
+	q.mu.Lock()
+	if q.closed {
+		q.mu.Unlock()
+		return
+	}
+	q.closed = true
+	for _, worker := range q.workers {
+		close(worker.jobs)
+	}
+	q.mu.Unlock()
+
+	q.wg.Wait()
+}
+
+func (q *ForwardQueue) run(worker *forwardWorker) {
+	defer q.wg.Done()
+	for job := range worker.jobs {
+		forwarder := q.newForwarder(job.url, job.token)
+		if err := forwarder.Forward(context.Background(), job.msg); err != nil {
+			q.logf("forward failed for message %s: %v", job.msg.MessageID, err)
+		}
+	}
 }
 
 // Enabled reports whether a destination URL was configured.

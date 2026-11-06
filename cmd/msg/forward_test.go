@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -229,6 +230,7 @@ func TestForwardRetryClassification(t *testing.T) {
 
 func TestPerProfileForwarding(t *testing.T) {
 	t.Setenv("AETHER_INGRESS_TOKEN", "")
+	swapForwardQueue(t, defaultForwardQueueDepth)
 
 	newCaptureServer := func(t *testing.T) (*httptest.Server, chan forwardedCapture) {
 		t.Helper()
@@ -272,7 +274,7 @@ func TestPerProfileForwarding(t *testing.T) {
 				t.Fatalf("forwarded body = %+v, want %+v", captured.body, want)
 			}
 			return captured
-		default:
+		case <-time.After(2 * time.Second):
 			t.Fatal("enabled profile did not forward")
 			return forwardedCapture{}
 		}
@@ -283,7 +285,7 @@ func TestPerProfileForwarding(t *testing.T) {
 		select {
 		case captured := <-got:
 			t.Fatalf("forwarded unexpectedly: %+v", captured)
-		default:
+		case <-time.After(100 * time.Millisecond):
 		}
 	}
 
@@ -362,4 +364,171 @@ func TestPerProfileForwarding(t *testing.T) {
 		forwardInbound(context.Background(), "+15555550100", want)
 		expectNotForwarded(t, got)
 	})
+}
+
+// writeForwardingConfig writes one profile config under a temp HOME.
+func writeForwardingConfig(t *testing.T, home, filename, account string, enabled bool, url string) {
+	t.Helper()
+	dir := filepath.Join(home, ".config", "msg")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	body := fmt.Sprintf(`{"account":%q,"forwarding":{"enabled":%t,"url":%q}}`, account, enabled, url)
+	if err := os.WriteFile(filepath.Join(dir, filename), []byte(body), 0o644); err != nil {
+		t.Fatalf("write %s: %v", filename, err)
+	}
+}
+
+// swapForwardQueue installs a test queue in place of the receiver's global one
+// and restores (and drains) it when the test ends.
+func swapForwardQueue(t *testing.T, depth int) *ForwardQueue {
+	t.Helper()
+	previous := inboundForwards
+	queue := NewForwardQueue(depth)
+	inboundForwards = queue
+	t.Cleanup(func() {
+		queue.Close()
+		inboundForwards = previous
+	})
+	return queue
+}
+
+func webhookBody(account, sender, text string, ts int64) string {
+	return fmt.Sprintf(`{"account":%q,"envelope":{"source":%q,"timestamp":%d,"dataMessage":{"message":%q,"timestamp":%d}}}`,
+		account, sender, ts, text, ts)
+}
+
+// TestForwardDoesNotBlockWebhook proves the webhook ACK happens after the DB
+// write but before the forward completes: the fake Aether is still blocked when
+// the client receives 200.
+func TestForwardDoesNotBlockWebhook(t *testing.T) {
+	t.Setenv("AETHER_INGRESS_TOKEN", "")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	account := "+15555550301"
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	arrived := make(chan ForwardMessage, 1)
+
+	forwardSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var msg ForwardMessage
+		if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
+			t.Errorf("decoding forwarded body: %v", err)
+		}
+		arrived <- msg
+		<-release
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	// Register the server close before the queue swap so the queue's cleanup
+	// (which drains jobs) runs first. The unblock cleanup is registered last,
+	// so it runs before both even when an assertion fails early.
+	t.Cleanup(forwardSrv.Close)
+	writeForwardingConfig(t, home, "config.json", account, true, forwardSrv.URL)
+	swapForwardQueue(t, defaultForwardQueueDepth)
+	t.Cleanup(unblock)
+	// Warm the profile DB so the measured ACK covers the write, not the
+	// first-time SQLite open (which is slow under -race).
+	if dbForAccount(account) == nil {
+		t.Fatal("could not open the profile DB")
+	}
+
+	webhook := newWebhookHandler(saveSignalPayload)
+	srv := httptest.NewServer(webhook)
+	defer srv.Close()
+
+	start := time.Now()
+	resp, err := http.Post(srv.URL, "application/json", strings.NewReader(webhookBody(account, "+15555550102", "!test", 1700000000000)))
+	if err != nil {
+		t.Fatalf("post webhook: %v", err)
+	}
+	defer resp.Body.Close()
+	elapsed := time.Since(start)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("webhook status = %d, want 200", resp.StatusCode)
+	}
+	if elapsed > 100*time.Millisecond {
+		t.Fatalf("webhook ACK took %s while the forward was blocked, want under 100ms", elapsed)
+	}
+
+	select {
+	case got := <-arrived:
+		if got.Sender != "+15555550102" || got.Text != "!test" {
+			t.Fatalf("forwarded message = %+v, want sender/text preserved", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("forward never reached the fake Aether")
+	}
+	unblock()
+}
+
+// TestForwardQueueFullDoesNotBlock proves a saturated forward queue drops the
+// newest message, counts it, and still ACKs the webhook immediately.
+func TestForwardQueueFullDoesNotBlock(t *testing.T) {
+	t.Setenv("AETHER_INGRESS_TOKEN", "")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	account := "+15555550302"
+	gate := make(chan struct{})
+	var gateOnce sync.Once
+	openGate := func() { gateOnce.Do(func() { close(gate) }) }
+	started := make(chan struct{}, 1)
+
+	forwardSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-gate
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	// Register the server close before the queue swap so the queue's cleanup
+	// (which drains buffered jobs) runs first. The gate cleanup is registered
+	// last, so it runs before both even when an assertion fails early.
+	t.Cleanup(forwardSrv.Close)
+	writeForwardingConfig(t, home, "config.json", account, true, forwardSrv.URL)
+	queue := swapForwardQueue(t, 1)
+	t.Cleanup(openGate)
+	if dbForAccount(account) == nil {
+		t.Fatal("could not open the profile DB")
+	}
+
+	webhook := newWebhookHandler(saveSignalPayload)
+	srv := httptest.NewServer(webhook)
+	defer srv.Close()
+
+	post := func(ts int64) {
+		t.Helper()
+		start := time.Now()
+		resp, err := http.Post(srv.URL, "application/json", strings.NewReader(webhookBody(account, "+15555550102", "!test", ts)))
+		if err != nil {
+			t.Fatalf("post webhook: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("webhook status = %d, want 200", resp.StatusCode)
+		}
+		if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+			t.Fatalf("webhook ACK took %s with a saturated forward queue", elapsed)
+		}
+	}
+
+	// The first job occupies the worker; the second fills the depth-1 buffer;
+	// the third finds it full and is dropped.
+	post(1700000000100)
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("forward worker never started")
+	}
+	post(1700000000200)
+	post(1700000000300)
+
+	if got := queue.Dropped(); got != 1 {
+		t.Fatalf("dropped forwards = %d, want 1", got)
+	}
+	openGate()
 }

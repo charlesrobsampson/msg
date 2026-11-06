@@ -152,7 +152,19 @@ func handleSignalReceiver(_ []string) {
 		http.NotFound(w, r)
 	})
 
-	mux.HandleFunc("/api/signal/webhook", func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("/api/signal/webhook", newWebhookHandler(saveSignalPayload))
+
+	fmt.Printf("Signal webhook receiver listening on %s...\n", addr)
+	if err := newReceiverServer(addr, mux).ListenAndServe(); err != nil {
+		fmt.Printf("Receiver failed: %v\n", err)
+	}
+}
+
+// newWebhookHandler builds the signal-cli webhook endpoint. save performs the
+// DB write and enqueues any forward; it is injected so tests can prove the ACK
+// does not wait on forwarding.
+func newWebhookHandler(save func(SignalWebhookPayload)) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			fmt.Printf("[receiver] unexpected method %s on webhook\n", r.Method)
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -174,18 +186,15 @@ func handleSignalReceiver(_ []string) {
 			return
 		}
 
-		for _, p := range payloads {
-			saveSignalPayload(p)
+		if save != nil {
+			for _, p := range payloads {
+				save(p)
+			}
 		}
 
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintln(w, "OK")
 	})
-
-	fmt.Printf("Signal webhook receiver listening on %s...\n", addr)
-	if err := newReceiverServer(addr, mux).ListenAndServe(); err != nil {
-		fmt.Printf("Receiver failed: %v\n", err)
-	}
 }
 
 // newReceiverServer bounds slow clients so the webhook listener cannot be held
