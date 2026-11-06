@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -17,7 +19,7 @@ import (
 const (
 	defaultForwardAttempts  = 3
 	defaultForwardBaseDelay = 200 * time.Millisecond
-	maxForwardDelay         = 2 * time.Second
+	maxForwardDelay         = 30 * time.Second
 	forwardHTTPTimeout      = 5 * time.Second
 )
 
@@ -109,26 +111,55 @@ func (f *Forwarder) Forward(ctx context.Context, msg ForwardMessage) error {
 	}
 
 	var lastErr error
+	made := 0
 	for attempt := 1; attempt <= attempts; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 
+		made = attempt
 		lastErr = f.post(ctx, msg)
 		if lastErr == nil {
 			return nil
 		}
-		if attempt == attempts {
+
+		retryable, retryAfter := shouldRetryForward(lastErr)
+		if !retryable || attempt == attempts {
 			break
 		}
 
-		f.logf("attempt %d/%d to %s failed: %v; retrying in %s", attempt, attempts, f.URL, lastErr, delay)
-		f.nap(delay)
+		wait := delay
+		if retryAfter > wait {
+			wait = retryAfter
+		}
+		f.logf("attempt %d/%d to %s failed: %v; retrying in %s", attempt, attempts, f.URL, lastErr, wait)
+		f.nap(wait)
 		delay = nextForwardDelay(delay)
 	}
 
-	f.logf("delivery to %s failed after %d attempt(s): %v", f.URL, attempts, lastErr)
+	f.logf("delivery to %s failed after %d attempt(s): %v", f.URL, made, lastErr)
 	return lastErr
+}
+
+// shouldRetryForward implements the shared retry classification: only network
+// errors, 429, and 5xx are transient. Every other 4xx is terminal.
+func shouldRetryForward(err error) (bool, time.Duration) {
+	var statusErr *client.StatusError
+	if errors.As(err, &statusErr) {
+		if statusErr.StatusCode == http.StatusTooManyRequests ||
+			(statusErr.StatusCode >= 500 && statusErr.StatusCode < 600) {
+			return true, statusErr.RetryAfter
+		}
+		return false, 0
+	}
+	if errors.Is(err, context.Canceled) {
+		return false, 0
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) || errors.Is(err, context.DeadlineExceeded) {
+		return true, 0
+	}
+	return false, 0
 }
 
 func (f *Forwarder) post(ctx context.Context, msg ForwardMessage) error {
@@ -154,10 +185,12 @@ func (f *Forwarder) post(ctx context.Context, msg ForwardMessage) error {
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		detail, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		if text := strings.TrimSpace(string(detail)); text != "" {
-			return fmt.Errorf("post to %s: status %s: %s", f.URL, resp.Status, text)
+		return &client.StatusError{
+			Provider:   "aether",
+			StatusCode: resp.StatusCode,
+			RetryAfter: client.ParseRetryAfter(resp.Header.Get("Retry-After")),
+			Body:       strings.TrimSpace(string(detail)),
 		}
-		return fmt.Errorf("post to %s: status %s", f.URL, resp.Status)
 	}
 
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))

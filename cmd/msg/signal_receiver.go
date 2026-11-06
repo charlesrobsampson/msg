@@ -146,12 +146,13 @@ func handleSignalReceiver(_ []string) {
 	}
 
 	// Catch-all logger helps diagnose connectivity issues.
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Printf("[receiver] %s %s (no handler)\n", r.Method, r.URL.Path)
 		http.NotFound(w, r)
 	})
 
-	http.HandleFunc("/api/signal/webhook", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/signal/webhook", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			fmt.Printf("[receiver] unexpected method %s on webhook\n", r.Method)
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -182,8 +183,20 @@ func handleSignalReceiver(_ []string) {
 	})
 
 	fmt.Printf("Signal webhook receiver listening on %s...\n", addr)
-	if err := http.ListenAndServe(addr, nil); err != nil {
+	if err := newReceiverServer(addr, mux).ListenAndServe(); err != nil {
 		fmt.Printf("Receiver failed: %v\n", err)
+	}
+}
+
+// newReceiverServer bounds slow clients so the webhook listener cannot be held
+// open indefinitely.
+func newReceiverServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
 	}
 }
 

@@ -2,6 +2,7 @@ package client
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -21,6 +22,7 @@ type OpenMessageProvider struct {
 	baseURL     string
 	account     string
 	unreachable bool
+	httpClient  *http.Client
 }
 
 func NewOpenMessageProvider(id string, cfg ProviderSettings, account string) *OpenMessageProvider {
@@ -54,6 +56,13 @@ func (p *OpenMessageProvider) ID() string {
 
 func (p *OpenMessageProvider) DisplayName() string {
 	return "Google Messages"
+}
+
+func (p *OpenMessageProvider) client() *http.Client {
+	if p.httpClient != nil {
+		return p.httpClient
+	}
+	return defaultProviderHTTPClient
 }
 
 func (p *OpenMessageProvider) FetchConversations(limit int) ([]Conversation, error) {
@@ -169,7 +178,7 @@ func (p *OpenMessageProvider) MarkAsRead(id string) error {
 	jsonPayload, _ := json.Marshal(payload)
 
 	url := fmt.Sprintf("%s/api/mark-read", p.baseURL)
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonPayload))
+	resp, err := doRequest(context.Background(), p.client(), http.MethodPost, url, jsonPayload, "application/json")
 	if err != nil {
 		p.unreachable = true
 		return err
@@ -183,12 +192,16 @@ func (p *OpenMessageProvider) MarkAsRead(id string) error {
 // If id starts with '+', it calls POST /api/new-conversation to get or create a
 // real conversation ID; otherwise id is returned unchanged.
 func (p *OpenMessageProvider) ensureConversationID(id string) (string, error) {
+	return p.ensureConversationIDContext(context.Background(), id)
+}
+
+func (p *OpenMessageProvider) ensureConversationIDContext(ctx context.Context, id string) (string, error) {
 	if !strings.HasPrefix(id, "+") {
 		return id, nil
 	}
 	payload := map[string]string{"phone_number": id}
 	jsonPayload, _ := json.Marshal(payload)
-	resp, err := http.Post(fmt.Sprintf("%s/api/new-conversation", p.baseURL), "application/json", bytes.NewBuffer(jsonPayload))
+	resp, err := doRequest(ctx, p.client(), http.MethodPost, fmt.Sprintf("%s/api/new-conversation", p.baseURL), jsonPayload, "application/json")
 	if err != nil {
 		p.unreachable = true
 		return "", err
@@ -197,7 +210,12 @@ func (p *OpenMessageProvider) ensureConversationID(id string) (string, error) {
 	p.unreachable = false
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("new-conversation returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return "", &StatusError{
+			Provider:   "openmessage",
+			StatusCode: resp.StatusCode,
+			RetryAfter: ParseRetryAfter(resp.Header.Get("Retry-After")),
+			Body:       string(body),
+		}
 	}
 	var result struct {
 		ConversationID string `json:"conversation_id"`
@@ -209,7 +227,12 @@ func (p *OpenMessageProvider) ensureConversationID(id string) (string, error) {
 }
 
 func (p *OpenMessageProvider) SendMessage(id, text string, styled bool) (bool, error) {
-	convID, err := p.ensureConversationID(id)
+	return p.SendMessageContext(context.Background(), id, text, styled)
+}
+
+// SendMessageContext is the cancellable form used by the Messenger facade.
+func (p *OpenMessageProvider) SendMessageContext(ctx context.Context, id, text string, styled bool) (bool, error) {
+	convID, err := p.ensureConversationIDContext(ctx, id)
 	if err != nil {
 		return false, err
 	}
@@ -217,7 +240,7 @@ func (p *OpenMessageProvider) SendMessage(id, text string, styled bool) (bool, e
 	jsonPayload, _ := json.Marshal(payload)
 
 	url := fmt.Sprintf("%s/api/send", p.baseURL)
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonPayload))
+	resp, err := doRequest(ctx, p.client(), http.MethodPost, url, jsonPayload, "application/json")
 	if err != nil {
 		p.unreachable = true
 		return false, err
@@ -226,6 +249,14 @@ func (p *OpenMessageProvider) SendMessage(id, text string, styled bool) (bool, e
 	p.unreachable = false
 
 	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return false, &StatusError{
+			Provider:   "openmessage",
+			StatusCode: resp.StatusCode,
+			RetryAfter: ParseRetryAfter(resp.Header.Get("Retry-After")),
+			Body:       string(body),
+		}
+	}
 	var result SendResponse
 	json.Unmarshal(body, &result)
 	if !result.Success {
@@ -233,7 +264,7 @@ func (p *OpenMessageProvider) SendMessage(id, text string, styled bool) (bool, e
 		if msg == "" {
 			msg = "provider rejected the message — check 'msg provider status'"
 		}
-		return false, fmt.Errorf("%s", msg)
+		return false, &StatusError{Provider: "openmessage", Body: msg}
 	}
 	return true, nil
 }
@@ -285,7 +316,7 @@ func (p *OpenMessageProvider) SendWithAttachments(conversationID, text string, s
 		mw.Close()
 
 		reqURL := fmt.Sprintf("%s/api/send-media", p.baseURL)
-		resp, err := http.Post(reqURL, mw.FormDataContentType(), &body)
+		resp, err := doRequest(context.Background(), p.client(), http.MethodPost, reqURL, body.Bytes(), mw.FormDataContentType())
 		if err != nil {
 			p.unreachable = true
 			return false, err
@@ -316,7 +347,7 @@ func (p *OpenMessageProvider) SendReaction(conversationID string, msg Message, e
 	}
 	jsonPayload, _ := json.Marshal(payload)
 
-	resp, err := http.Post(fmt.Sprintf("%s/api/react", p.baseURL), "application/json", bytes.NewBuffer(jsonPayload))
+	resp, err := doRequest(context.Background(), p.client(), http.MethodPost, fmt.Sprintf("%s/api/react", p.baseURL), jsonPayload, "application/json")
 	if err != nil {
 		p.unreachable = true
 		return false, err
@@ -388,7 +419,7 @@ func (p *OpenMessageProvider) GetStatus() (*OMStatus, error) {
 // Disconnect calls POST /api/unpair to disconnect and remove stored credentials.
 // After this, re-pairing via QR code is required to reconnect.
 func (p *OpenMessageProvider) Disconnect() error {
-	resp, err := http.Post(fmt.Sprintf("%s/api/unpair", p.baseURL), "application/json", nil)
+	resp, err := doRequest(context.Background(), p.client(), http.MethodPost, fmt.Sprintf("%s/api/unpair", p.baseURL), nil, "application/json")
 	if err != nil {
 		return err
 	}
@@ -403,7 +434,7 @@ func (p *OpenMessageProvider) Disconnect() error {
 // ReconnectGoogle calls POST /api/google/reconnect to attempt a soft reconnect
 // using existing credentials (no QR code needed).
 func (p *OpenMessageProvider) ReconnectGoogle() error {
-	resp, err := http.Post(fmt.Sprintf("%s/api/google/reconnect", p.baseURL), "application/json", nil)
+	resp, err := doRequest(context.Background(), p.client(), http.MethodPost, fmt.Sprintf("%s/api/google/reconnect", p.baseURL), nil, "application/json")
 	if err != nil {
 		return err
 	}

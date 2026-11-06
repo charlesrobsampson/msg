@@ -2,6 +2,7 @@ package client
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -23,6 +24,7 @@ type SignalProvider struct {
 	account     string
 	unreachable bool
 	db          *SignalDB
+	httpClient  *http.Client
 }
 
 type SignalGroup struct {
@@ -96,6 +98,13 @@ func (p *SignalProvider) GetBaseURL() string {
 
 func (p *SignalProvider) DisplayName() string {
 	return "Signal"
+}
+
+func (p *SignalProvider) client() *http.Client {
+	if p.httpClient != nil {
+		return p.httpClient
+	}
+	return defaultProviderHTTPClient
 }
 
 func (p *SignalProvider) FetchConversations(limit int) ([]Conversation, error) {
@@ -262,6 +271,11 @@ func (p *SignalProvider) signalSendBody(conversationID, text string, styled bool
 }
 
 func (p *SignalProvider) SendMessage(conversationID, text string, styled bool) (bool, error) {
+	return p.SendMessageContext(context.Background(), conversationID, text, styled)
+}
+
+// SendMessageContext is the cancellable form used by the Messenger facade.
+func (p *SignalProvider) SendMessageContext(ctx context.Context, conversationID, text string, styled bool) (bool, error) {
 	if p.account == "" {
 		return false, fmt.Errorf("SIGNAL_ACCOUNT not set")
 	}
@@ -273,7 +287,7 @@ func (p *SignalProvider) SendMessage(conversationID, text string, styled bool) (
 	accountPath := "/v1/" + url.PathEscape(p.account) + "/sendv2"
 	for _, sendPath := range []string{accountPath, "/v2/send", "/v1/send"} {
 		sendURL := fmt.Sprintf("%s%s", p.baseURL, sendPath)
-		resp, err := http.Post(sendURL, "application/json", bytes.NewBuffer(jsonPayload))
+		resp, err := doRequest(ctx, p.client(), http.MethodPost, sendURL, jsonPayload, "application/json")
 		if err != nil {
 			p.unreachable = true
 			return false, err
@@ -285,7 +299,6 @@ func (p *SignalProvider) SendMessage(conversationID, text string, styled bool) (
 
 		if resp.StatusCode == 404 {
 			// This path doesn't exist on this server version — try the next one.
-			jsonPayload = append([]byte(nil), jsonPayload...)
 			continue
 		}
 
@@ -313,7 +326,12 @@ func (p *SignalProvider) SendMessage(conversationID, text string, styled bool) (
 			return true, nil
 		}
 
-		return false, fmt.Errorf("signal API %s returned HTTP %d: %s", sendPath, resp.StatusCode, strings.TrimSpace(string(body)))
+		return false, &StatusError{
+			Provider:   "signal",
+			StatusCode: resp.StatusCode,
+			RetryAfter: ParseRetryAfter(resp.Header.Get("Retry-After")),
+			Body:       string(body),
+		}
 	}
 
 	return false, fmt.Errorf("signal API: no working send endpoint found")
@@ -343,7 +361,7 @@ func (p *SignalProvider) SendWithAttachments(conversationID, text string, styled
 	accountPath := "/v1/" + url.PathEscape(p.account) + "/sendv2"
 	for _, sendPath := range []string{accountPath, "/v2/send", "/v1/send"} {
 		url := fmt.Sprintf("%s%s", p.baseURL, sendPath)
-		resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonPayload))
+		resp, err := doRequest(context.Background(), p.client(), http.MethodPost, url, jsonPayload, "application/json")
 		if err != nil {
 			p.unreachable = true
 			return false, err
@@ -435,7 +453,7 @@ func (p *SignalProvider) sendReadReceipt(conversationID string, timestamps []int
 	accountPath := fmt.Sprintf("%s/v1/receipts/%s", p.baseURL, url.PathEscape(p.account))
 	genericPath := fmt.Sprintf("%s/v1/receipts", p.baseURL)
 	for _, endpoint := range []string{accountPath, genericPath} {
-		resp, err := http.Post(endpoint, "application/json", bytes.NewBuffer(jsonPayload))
+		resp, err := doRequest(context.Background(), p.client(), http.MethodPost, endpoint, jsonPayload, "application/json")
 		if err != nil {
 			continue
 		}
@@ -539,7 +557,7 @@ func (p *SignalProvider) SendReaction(conversationID string, msg Message, emoji 
 	}
 	jsonPayload, _ = json.Marshal(payload)
 	endpoint = fmt.Sprintf("%s/v1/reactions/%s", p.baseURL, url.PathEscape(p.account))
-	resp, err := http.Post(endpoint, "application/json", bytes.NewBuffer(jsonPayload))
+	resp, err := doRequest(context.Background(), p.client(), http.MethodPost, endpoint, jsonPayload, "application/json")
 	if err != nil {
 		p.unreachable = true
 		return false, err
@@ -609,7 +627,7 @@ func (p *SignalProvider) Unregister() error {
 	}
 	jsonPayload, _ := json.Marshal(payload)
 	url := fmt.Sprintf("%s/v1/unregister/%s", p.baseURL, p.account)
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonPayload))
+	resp, err := doRequest(context.Background(), p.client(), http.MethodPost, url, jsonPayload, "application/json")
 	if err != nil {
 		return err
 	}

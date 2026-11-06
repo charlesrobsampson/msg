@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -164,6 +165,66 @@ func TestForwardInbound(t *testing.T) {
 type forwardedCapture struct {
 	token string
 	body  ForwardMessage
+}
+
+// TestForwardRetryClassification proves terminal 4xx responses are attempted
+// once, while 429 and 5xx responses retry and honour Retry-After.
+func TestForwardRetryClassification(t *testing.T) {
+	tests := []struct {
+		name        string
+		status      int
+		retryAfter  string
+		wantAttempt int32
+	}{
+		{name: "400 terminal", status: http.StatusBadRequest, wantAttempt: 1},
+		{name: "401 terminal", status: http.StatusUnauthorized, wantAttempt: 1},
+		{name: "403 terminal", status: http.StatusForbidden, wantAttempt: 1},
+		{name: "404 terminal", status: http.StatusNotFound, wantAttempt: 1},
+		{name: "409 terminal", status: http.StatusConflict, wantAttempt: 1},
+		{name: "429 retryable", status: http.StatusTooManyRequests, retryAfter: "2", wantAttempt: 3},
+		{name: "500 retryable", status: http.StatusInternalServerError, wantAttempt: 3},
+		{name: "503 retryable", status: http.StatusServiceUnavailable, wantAttempt: 3},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var attempts int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				atomic.AddInt32(&attempts, 1)
+				if tc.retryAfter != "" {
+					w.Header().Set("Retry-After", tc.retryAfter)
+				}
+				http.Error(w, http.StatusText(tc.status), tc.status)
+			}))
+			defer srv.Close()
+
+			var delays []time.Duration
+			f := NewForwarder(srv.URL, "")
+			f.MaxAttempts = 3
+			f.BaseDelay = time.Millisecond
+			f.Sleep = func(d time.Duration) { delays = append(delays, d) }
+			f.Logf = func(string, ...any) {}
+
+			err := f.Forward(context.Background(), ForwardMessage{Sender: "+1", Text: "hi"})
+			if err == nil {
+				t.Fatal("Forward() returned nil for a failing Aether")
+			}
+			if got := atomic.LoadInt32(&attempts); got != tc.wantAttempt {
+				t.Fatalf("attempts = %d, want %d", got, tc.wantAttempt)
+			}
+			if tc.retryAfter != "" {
+				want := 2 * time.Second
+				if len(delays) != 2 {
+					t.Fatalf("backoff sleeps = %d, want 2", len(delays))
+				}
+				for i, delay := range delays {
+					if delay < want {
+						t.Errorf("delay %d = %s, want at least %s from Retry-After", i, delay, want)
+					}
+				}
+			}
+		})
+	}
 }
 
 func TestPerProfileForwarding(t *testing.T) {
