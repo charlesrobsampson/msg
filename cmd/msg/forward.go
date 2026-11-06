@@ -7,8 +7,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
+
+	"github.com/charlesrobsampson/msg/client"
 )
 
 const (
@@ -41,48 +44,43 @@ type Forwarder struct {
 	Logf        func(format string, args ...any)
 }
 
+// defaultForwardHTTPClient is shared by every forwarder so per-message
+// forwarding does not allocate a new client for each inbound message.
+var defaultForwardHTTPClient = &http.Client{Timeout: forwardHTTPTimeout}
+
 // NewForwarder builds a forwarder. An empty URL means forwarding is disabled.
 func NewForwarder(url, token string) *Forwarder {
 	return &Forwarder{
 		URL:         strings.TrimSpace(url),
 		Token:       strings.TrimSpace(token),
-		Client:      &http.Client{Timeout: forwardHTTPTimeout},
+		Client:      defaultForwardHTTPClient,
 		MaxAttempts: defaultForwardAttempts,
 		BaseDelay:   defaultForwardBaseDelay,
 	}
 }
 
-// newForwarderFromArgs resolves the signal-receiver's forwarding flags, falling
-// back to MSG_FORWARD_URL and AETHER_INGRESS_TOKEN. Flags win over the
-// environment.
-func newForwarderFromArgs(args []string, getenv func(string) string) *Forwarder {
-	if getenv == nil {
-		getenv = func(string) string { return "" }
+// forwardInbound posts one normalized message to Aether when the sending
+// account's profile has opted in. The config is re-read for every message so
+// forwarding can be toggled without restarting the receiver. Config errors and
+// an enabled-but-empty URL are treated as "disabled for this message"; they are
+// logged and never fail ingestion. Forward logs its own delivery failures.
+func forwardInbound(ctx context.Context, account string, msg ForwardMessage) {
+	target, err := client.ForwardingForAccount(account)
+	if err != nil {
+		fmt.Printf("[receiver] forwarding config for account %s: %v\n", account, err)
+		return
+	}
+	if !target.Enabled {
+		return
+	}
+	url := strings.TrimSpace(target.URL)
+	if url == "" {
+		fmt.Printf("[receiver] forwarding enabled for account %s but no url is configured\n", account)
+		return
 	}
 
-	url := strings.TrimSpace(getenv("MSG_FORWARD_URL"))
-	token := strings.TrimSpace(getenv("AETHER_INGRESS_TOKEN"))
-
-	for i := 0; i < len(args); i++ {
-		switch arg := args[i]; {
-		case arg == "--forward":
-			if i+1 < len(args) {
-				i++
-				url = strings.TrimSpace(args[i])
-			}
-		case strings.HasPrefix(arg, "--forward="):
-			url = strings.TrimSpace(strings.TrimPrefix(arg, "--forward="))
-		case arg == "--forward-token":
-			if i+1 < len(args) {
-				i++
-				token = strings.TrimSpace(args[i])
-			}
-		case strings.HasPrefix(arg, "--forward-token="):
-			token = strings.TrimSpace(strings.TrimPrefix(arg, "--forward-token="))
-		}
-	}
-
-	return NewForwarder(url, token)
+	forwarder := NewForwarder(url, os.Getenv("AETHER_INGRESS_TOKEN"))
+	_ = forwarder.Forward(ctx, msg)
 }
 
 // Enabled reports whether a destination URL was configured.

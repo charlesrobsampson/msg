@@ -85,11 +85,6 @@ var (
 	dbByAcct  = make(map[string]*client.SignalDB)
 )
 
-// inboundForwarder is configured once when the receiver starts. It stays
-// disabled (the existing local-only behaviour) unless --forward or
-// MSG_FORWARD_URL is supplied.
-var inboundForwarder = NewForwarder("", "")
-
 func dbForAccount(account string) *client.SignalDB {
 	dbCacheMu.Lock()
 	defer dbCacheMu.Unlock()
@@ -110,12 +105,7 @@ func dbForAccount(account string) *client.SignalDB {
 	return db
 }
 
-func handleSignalReceiver(args []string) {
-	inboundForwarder = newForwarderFromArgs(args, os.Getenv)
-	if inboundForwarder.Enabled() {
-		fmt.Printf("[receiver] forwarding inbound messages to %s\n", inboundForwarder.URL)
-	}
-
+func handleSignalReceiver(_ []string) {
 	port := 7008
 	if envPort := os.Getenv("MSG_SIGNAL_RECEIVER_PORT"); envPort != "" {
 		if p, err := strconv.Atoi(envPort); err == nil {
@@ -361,10 +351,11 @@ func saveSignalPayload(p SignalWebhookPayload) {
 		fmt.Printf("[receiver] saved %s message for conv %s (account %s)\n", typeStr, convID, p.Account)
 	}
 
-	// Forward only after the DB write. Forward is best-effort: it logs its own
-	// retries/give-up and never changes the receiver's success path.
+	// Forward only after the DB write, using the sending account's profile. The
+	// config is re-read per message so forwarding can be toggled without a
+	// restart. Forwarding is best-effort and never changes the success path.
 	if inbound != nil && strings.TrimSpace(inbound.Sender) != "" && strings.TrimSpace(inbound.Text) != "" {
-		_ = inboundForwarder.Forward(context.Background(), *inbound)
+		forwardInbound(context.Background(), p.Account, *inbound)
 	}
 }
 

@@ -43,6 +43,13 @@ func ConfigDirPath() (string, error) {
 	return filepath.Join(home, configDirName), nil
 }
 
+// ForwardingConfig controls optional inbound forwarding to Aether. It is
+// disabled unless a profile explicitly opts in.
+type ForwardingConfig struct {
+	Enabled bool   `json:"enabled"`
+	URL     string `json:"url,omitempty"`
+}
+
 type Config struct {
 	Account        string                      `json:"account,omitempty"`
 	Editor         string                      `json:"editor"`
@@ -50,6 +57,7 @@ type Config struct {
 	ViewportHeight int                         `json:"viewport_height"`
 	Theme          ThemeConfig                 `json:"theme"`
 	Providers      map[string]ProviderSettings `json:"providers"`
+	Forwarding     ForwardingConfig            `json:"forwarding,omitempty"`
 }
 
 const configDirName = ".config/msg"
@@ -202,6 +210,63 @@ func FindProfileForAccount(account string) (string, error) {
 	}
 
 	return "", fmt.Errorf("no profile found for account %s", account)
+}
+
+// SettingsPathForProfile returns the config path for one profile without
+// consulting the process-global current profile. An empty profile is the
+// default config.json.
+func SettingsPathForProfile(profile string) (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	filename := settingsFileName
+	if profile != "" {
+		filename = "config-" + profile + ".json"
+	}
+	return filepath.Join(home, configDirName, filename), nil
+}
+
+// LoadConfigForProfile reads one profile's config. It never reads the
+// process-global profile and never rewrites the file. A missing file returns
+// the defaults; malformed JSON is an error so callers can treat forwarding as
+// disabled for that message.
+func LoadConfigForProfile(profile string) (Config, error) {
+	defaultConfig := NewDefaultConfig()
+	path, err := SettingsPathForProfile(profile)
+	if err != nil {
+		return defaultConfig, err
+	}
+
+	fileData, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return defaultConfig, nil
+	}
+	if err != nil {
+		return defaultConfig, err
+	}
+
+	var cfg Config
+	if err := json.Unmarshal(fileData, &cfg); err != nil {
+		return defaultConfig, fmt.Errorf("malformed config file at %s: %v", path, err)
+	}
+	return cfg, nil
+}
+
+// ForwardingForAccount resolves the profile that owns account and returns its
+// forwarding settings. When no profile matches, it falls back to the profile
+// this process was started with, which covers both per-profile and
+// all-accounts receivers.
+func ForwardingForAccount(account string) (ForwardingConfig, error) {
+	profile, err := FindProfileForAccount(account)
+	if err != nil {
+		profile = GetProfile()
+	}
+	cfg, err := LoadConfigForProfile(profile)
+	if err != nil {
+		return ForwardingConfig{}, err
+	}
+	return cfg.Forwarding, nil
 }
 
 func LoadConfig() (Config, error) {
