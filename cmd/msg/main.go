@@ -417,6 +417,9 @@ func main() {
 	case "signal-receiver", "receive":
 		handleSignalReceiver(os.Args[2:])
 
+	case "replay":
+		handleReplay(os.Args[2:])
+
 	case "server":
 		if hasHelpFlag(os.Args[2:]) {
 			printCommandHelp("server")
@@ -952,6 +955,16 @@ func printCommandHelp(cmd string) {
 		fmt.Println("  msg server start")
 		fmt.Println("  msg server status")
 
+	case "replay":
+		fmt.Println("Usage: msg replay")
+		fmt.Println()
+		fmt.Println("Deliver forwards left pending in the durable outbox.")
+		fmt.Println("The signal-receiver does this automatically when it starts; use this")
+		fmt.Println("command for a manual retry after an outage.")
+		fmt.Println()
+		fmt.Println("Options:")
+		fmt.Println("  -h, --help         Show this help")
+
 	case "config":
 		fmt.Println("Usage: msg config [set <key> <value>]")
 		fmt.Println()
@@ -983,6 +996,7 @@ func printHelp() {
 	fmt.Println("  server start            Start all backend services")
 	fmt.Println("  server stop             Stop all backend services")
 	fmt.Println("  server status           Show service health")
+	fmt.Println("  replay                  Replay pending forwards from the outbox")
 	fmt.Println()
 	fmt.Println("Messaging:")
 	fmt.Println("  list [-l <n>]                                   List conversations")

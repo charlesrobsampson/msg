@@ -18,6 +18,9 @@ const (
 	forwardDurationName   = "msg_forward_duration_seconds"
 	forwardQueueDepthName = "msg_forward_queue_depth"
 	forwardDroppedName    = "msg_forward_dropped_total"
+
+	forwardOutboxPendingName  = "msg_forward_outbox_pending"
+	forwardOutboxReplayedName = "msg_forward_outbox_replayed_total"
 )
 
 // Bounded forward outcome labels. Keeping them as constants prevents
@@ -54,20 +57,24 @@ type durationSample struct {
 
 // Metrics is the msg-side Prometheus registry. It is safe for concurrent use.
 type Metrics struct {
-	mu        sync.Mutex
-	attempts  map[attemptKey]uint64
-	durations map[attemptKey]*durationSample
-	depths    map[string]int
-	dropped   map[dropKey]uint64
+	mu             sync.Mutex
+	attempts       map[attemptKey]uint64
+	durations      map[attemptKey]*durationSample
+	depths         map[string]int
+	dropped        map[dropKey]uint64
+	outboxPending  map[string]int
+	outboxReplayed map[string]uint64
 }
 
 // NewMetrics returns an empty registry.
 func NewMetrics() *Metrics {
 	return &Metrics{
-		attempts:  make(map[attemptKey]uint64),
-		durations: make(map[attemptKey]*durationSample),
-		depths:    make(map[string]int),
-		dropped:   make(map[dropKey]uint64),
+		attempts:       make(map[attemptKey]uint64),
+		durations:      make(map[attemptKey]*durationSample),
+		depths:         make(map[string]int),
+		dropped:        make(map[dropKey]uint64),
+		outboxPending:  make(map[string]int),
+		outboxReplayed: make(map[string]uint64),
 	}
 }
 
@@ -159,6 +166,49 @@ func (m *Metrics) QueueDepth(profile string) int {
 	return m.depths[metricProfile(profile)]
 }
 
+// SetOutboxPending records how many durable outbox rows await delivery.
+func (m *Metrics) SetOutboxPending(profile string, pending int) {
+	if m == nil {
+		return
+	}
+	if pending < 0 {
+		pending = 0
+	}
+	m.mu.Lock()
+	m.outboxPending[metricProfile(profile)] = pending
+	m.mu.Unlock()
+}
+
+// OutboxPending reports the last recorded pending outbox count for a profile.
+func (m *Metrics) OutboxPending(profile string) int {
+	if m == nil {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.outboxPending[metricProfile(profile)]
+}
+
+// IncOutboxReplayed counts one outbox row re-enqueued after a restart or replay.
+func (m *Metrics) IncOutboxReplayed(profile string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.outboxReplayed[metricProfile(profile)]++
+	m.mu.Unlock()
+}
+
+// OutboxReplayed reports how many outbox rows were replayed for a profile.
+func (m *Metrics) OutboxReplayed(profile string) uint64 {
+	if m == nil {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.outboxReplayed[metricProfile(profile)]
+}
+
 // Duration reports the sum and count for one profile/result pair.
 func (m *Metrics) Duration(profile, result string) (float64, uint64) {
 	if m == nil {
@@ -208,6 +258,14 @@ func (m *Metrics) writeExposition(b *strings.Builder) {
 	for key, value := range m.dropped {
 		dropped[key] = value
 	}
+	outboxPending := make(map[string]int, len(m.outboxPending))
+	for profile, pending := range m.outboxPending {
+		outboxPending[profile] = pending
+	}
+	outboxReplayed := make(map[string]uint64, len(m.outboxReplayed))
+	for profile, replayed := range m.outboxReplayed {
+		outboxReplayed[profile] = replayed
+	}
 	m.mu.Unlock()
 
 	fmt.Fprintf(b, "# HELP %s Total forward POST attempts by profile and result.\n", forwardAttemptsName)
@@ -253,6 +311,28 @@ func (m *Metrics) writeExposition(b *strings.Builder) {
 	for _, key := range droppedKeys {
 		fmt.Fprintf(b, "%s{profile=%q,reason=%q} %d\n",
 			forwardDroppedName, key.profile, key.reason, dropped[key])
+	}
+
+	fmt.Fprintf(b, "# HELP %s Durable forward outbox rows awaiting delivery by profile.\n", forwardOutboxPendingName)
+	fmt.Fprintf(b, "# TYPE %s gauge\n", forwardOutboxPendingName)
+	profiles = profiles[:0]
+	for profile := range outboxPending {
+		profiles = append(profiles, profile)
+	}
+	sort.Strings(profiles)
+	for _, profile := range profiles {
+		fmt.Fprintf(b, "%s{profile=%q} %d\n", forwardOutboxPendingName, profile, outboxPending[profile])
+	}
+
+	fmt.Fprintf(b, "# HELP %s Outbox rows re-enqueued after a restart or replay by profile.\n", forwardOutboxReplayedName)
+	fmt.Fprintf(b, "# TYPE %s counter\n", forwardOutboxReplayedName)
+	profiles = profiles[:0]
+	for profile := range outboxReplayed {
+		profiles = append(profiles, profile)
+	}
+	sort.Strings(profiles)
+	for _, profile := range profiles {
+		fmt.Fprintf(b, "%s{profile=%q} %d\n", forwardOutboxReplayedName, profile, outboxReplayed[profile])
 	}
 }
 

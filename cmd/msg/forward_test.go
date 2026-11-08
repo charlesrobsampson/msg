@@ -296,10 +296,10 @@ func TestPerProfileForwarding(t *testing.T) {
 		writeConfig(t, home, "config.json", "+15555550100", true, srv.URL)
 		writeConfig(t, home, "config-bob.json", "+15555550101", false, srv.URL)
 
-		forwardInbound(context.Background(), "+15555550100", want)
+		forwardInboundForTest(t, "+15555550100", want)
 		expectForwarded(t, got)
 
-		forwardInbound(context.Background(), "+15555550101", want)
+		forwardInboundForTest(t, "+15555550101", want)
 		expectNotForwarded(t, got)
 	})
 
@@ -309,11 +309,11 @@ func TestPerProfileForwarding(t *testing.T) {
 		srv, got := newCaptureServer(t)
 		writeConfig(t, home, "config.json", "+15555550100", true, srv.URL)
 
-		forwardInbound(context.Background(), "+15555550100", want)
+		forwardInboundForTest(t, "+15555550100", want)
 		expectForwarded(t, got)
 
 		writeConfig(t, home, "config.json", "+15555550100", false, srv.URL)
-		forwardInbound(context.Background(), "+15555550100", want)
+		forwardInboundForTest(t, "+15555550100", want)
 		expectNotForwarded(t, got)
 	})
 
@@ -323,7 +323,7 @@ func TestPerProfileForwarding(t *testing.T) {
 		_, got := newCaptureServer(t)
 		writeConfig(t, home, "config.json", "+15555550100", true, "")
 
-		forwardInbound(context.Background(), "+15555550100", want)
+		forwardInboundForTest(t, "+15555550100", want)
 		expectNotForwarded(t, got)
 	})
 
@@ -334,7 +334,7 @@ func TestPerProfileForwarding(t *testing.T) {
 		srv, got := newCaptureServer(t)
 		writeConfig(t, home, "config.json", "+15555550100", true, srv.URL)
 
-		forwardInbound(context.Background(), "+15555550100", want)
+		forwardInboundForTest(t, "+15555550100", want)
 		if captured := expectForwarded(t, got); captured.token != "ingress-secret" {
 			t.Fatalf("X-Aether-Token = %q, want %q", captured.token, "ingress-secret")
 		}
@@ -345,7 +345,7 @@ func TestPerProfileForwarding(t *testing.T) {
 		t.Setenv("HOME", home)
 		_, got := newCaptureServer(t)
 
-		forwardInbound(context.Background(), "+15555550100", want)
+		forwardInboundForTest(t, "+15555550100", want)
 		expectNotForwarded(t, got)
 	})
 
@@ -361,7 +361,7 @@ func TestPerProfileForwarding(t *testing.T) {
 			t.Fatalf("write malformed config: %v", err)
 		}
 
-		forwardInbound(context.Background(), "+15555550100", want)
+		forwardInboundForTest(t, "+15555550100", want)
 		expectNotForwarded(t, got)
 	})
 }
@@ -387,7 +387,7 @@ func TestForwardProfileMetricLabel(t *testing.T) {
 
 	registry := NewMetrics()
 	queue := swapForwardQueueWithMetrics(t, 4, registry)
-	forwardInbound(context.Background(), account, ForwardMessage{
+	forwardInboundForTest(t, account, ForwardMessage{
 		Sender:    "+15555550102",
 		Text:      "!test",
 		Provider:  "signal",

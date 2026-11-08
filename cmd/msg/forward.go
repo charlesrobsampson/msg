@@ -9,7 +9,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -39,8 +38,8 @@ type ForwardMessage struct {
 }
 
 // Forwarder posts inbound messages to Aether with a bounded number of retries
-// and exponential backoff. It never spools messages: msg's own database remains
-// the replay source.
+// and exponential backoff. Durable queued work lives in the per-profile
+// `forward_outbox` table, not in this type.
 type Forwarder struct {
 	URL         string
 	Token       string
@@ -72,51 +71,45 @@ func NewForwarder(url, token string) *Forwarder {
 	}
 }
 
-// inboundForwards is the receiver-wide, bounded per-account forward queue. It
-// is enqueued after the DB write, so the webhook ACK never waits on Aether.
+// inboundForwards is the receiver-wide, bounded per-profile forward queue. It
+// is enqueued after the durable DB write, so the webhook ACK never waits on
+// Aether.
 var inboundForwards = NewForwardQueueWithMetrics(defaultForwardQueueDepth, forwardMetrics)
 
-// forwardInbound hands one normalized message to the sending account's
-// per-profile worker when that profile has opted in. The config is re-read for
-// every message so forwarding can be toggled without restarting the receiver.
-// Config errors and an enabled-but-empty URL are treated as "disabled for this
-// message"; they are logged and never fail ingestion. Enqueue never blocks: a
-// full queue drops the newest message and counts it.
-func forwardInbound(ctx context.Context, account string, msg ForwardMessage) {
-	if ctx != nil {
-		if err := ctx.Err(); err != nil {
-			return
-		}
-	}
-	// Queue workers and metric labels are keyed by profile name, never by the
-	// account: phone numbers must not become Prometheus labels (plan §3.19).
-	profile, err := client.FindProfileForAccount(account)
-	if err != nil {
+// errForwardURLMissing marks a profile that opted in but has no destination.
+var errForwardURLMissing = errors.New("forwarding enabled but no url configured")
+
+// resolveForwardTarget reads the per-account forwarding setting. The profile
+// name is used for worker keying, metric labels, and log correlation; it is
+// never the account itself.
+func resolveForwardTarget(account string) (profile, url string, enabled bool, err error) {
+	profile, lookupErr := client.FindProfileForAccount(account)
+	if lookupErr != nil {
 		profile = client.GetProfile()
 	}
 	target, err := client.ForwardingForAccount(account)
 	if err != nil {
-		fmt.Printf("[receiver] forwarding config for profile %s message %s: %v\n", metricProfile(profile), msg.MessageID, err)
-		return
+		return profile, "", false, err
 	}
 	if !target.Enabled {
-		return
+		return profile, "", false, nil
 	}
-	url := strings.TrimSpace(target.URL)
+	url = strings.TrimSpace(target.URL)
 	if url == "" {
-		fmt.Printf("[receiver] forwarding enabled for profile %s but no url is configured (message %s)\n", metricProfile(profile), msg.MessageID)
-		return
+		return profile, "", false, errForwardURLMissing
 	}
-
-	inboundForwards.Enqueue(profile, url, os.Getenv("AETHER_INGRESS_TOKEN"), msg)
+	return profile, url, true, nil
 }
 
 // forwardJob is one queued delivery. The URL and token are resolved at enqueue
-// time so a config toggle affects subsequent messages only.
+// time so a config toggle affects subsequent messages only. A non-nil store
+// marks a durable outbox job whose row is deleted once the attempt finishes.
 type forwardJob struct {
-	url   string
-	token string
-	msg   ForwardMessage
+	url       string
+	token     string
+	msg       ForwardMessage
+	store     *client.SignalDB
+	messageID string
 }
 
 type forwardWorker struct {
@@ -165,18 +158,29 @@ func NewForwardQueueWithMetrics(depth int, metrics *Metrics) *ForwardQueue {
 	}
 }
 
-// Enqueue offers one job without blocking. It returns false when the profile's
-// buffer is full or the queue is closed. The profile name is used both as the
-// worker key and as the metric label; callers must never pass an account or any
-// other unbounded/PII value.
+// Enqueue offers one in-memory job without blocking. It returns false when the
+// profile's buffer is full or the queue is closed. The profile name is used
+// both as the worker key and as the metric label; callers must never pass an
+// account or any other unbounded/PII value.
 func (q *ForwardQueue) Enqueue(profile, url, token string, msg ForwardMessage) bool {
+	return q.enqueue(profile, url, token, msg, nil, "")
+}
+
+// EnqueueDurable offers one job backed by a forward_outbox row. The row is
+// deleted when the worker finishes; a closed or full queue leaves it pending for
+// replay instead of losing it.
+func (q *ForwardQueue) EnqueueDurable(store *client.SignalDB, profile, url, token string, msg ForwardMessage, messageID string) bool {
+	return q.enqueue(profile, url, token, msg, store, messageID)
+}
+
+func (q *ForwardQueue) enqueue(profile, url, token string, msg ForwardMessage, store *client.SignalDB, messageID string) bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
 	if q.closed {
 		q.dropped.Add(1)
 		q.metrics.RecordDropped(profile, DropShutdown)
-		q.logf("forward queue closed for profile %s; dropping message %s", metricProfile(profile), msg.MessageID)
+		q.logf("forward queue closed for profile %s; deferring message %s", metricProfile(profile), msg.MessageID)
 		return false
 	}
 
@@ -189,8 +193,9 @@ func (q *ForwardQueue) Enqueue(profile, url, token string, msg ForwardMessage) b
 		go q.run(worker, profile)
 	}
 
+	job := forwardJob{url: url, token: token, msg: msg, store: store, messageID: messageID}
 	select {
-	case worker.jobs <- forwardJob{url: url, token: token, msg: msg}:
+	case worker.jobs <- job:
 		q.metrics.SetQueueDepth(profile, len(worker.jobs))
 		return true
 	default:
@@ -198,7 +203,7 @@ func (q *ForwardQueue) Enqueue(profile, url, token string, msg ForwardMessage) b
 		q.metrics.RecordDropped(profile, DropQueueFull)
 		q.metrics.RecordAttempt(profile, AttemptQueueFull, 0)
 		q.metrics.SetQueueDepth(profile, len(worker.jobs))
-		q.logf("forward queue full for profile %s; dropping message %s", metricProfile(profile), msg.MessageID)
+		q.logf("forward queue full for profile %s; deferring message %s", metricProfile(profile), msg.MessageID)
 		return false
 	}
 }
@@ -232,7 +237,22 @@ func (q *ForwardQueue) run(worker *forwardWorker, profile string) {
 		forwarder := q.newForwarder(job.url, job.token)
 		forwarder.Profile = profile
 		forwarder.Metrics = q.metrics
-		if err := forwarder.Forward(context.Background(), job.msg); err != nil {
+		err := forwarder.Forward(context.Background(), job.msg)
+		if job.store != nil {
+			// The attempt is finished, successfully or after bounded retries, so
+			// the durable row can go. A crash mid-attempt leaves it for replay.
+			messageID := job.messageID
+			if messageID == "" {
+				messageID = job.msg.MessageID
+			}
+			if delErr := job.store.DeleteForward(messageID); delErr != nil {
+				q.logf("forward outbox delete for profile %s message %s: %v", metricProfile(profile), messageID, delErr)
+			}
+			if pending, countErr := job.store.PendingForwardCount(); countErr == nil {
+				q.metrics.SetOutboxPending(profile, pending)
+			}
+		}
+		if err != nil {
 			q.logf("forward failed for profile %s message %s: %v", metricProfile(profile), job.msg.MessageID, err)
 		}
 	}

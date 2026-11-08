@@ -102,6 +102,17 @@ func dbForAccount(account string) *client.SignalDB {
 		return nil
 	}
 	dbByAcct[account] = db
+
+	// Replaying before the first new message keeps per-profile order and turns a
+	// restart into at-least-once delivery (A07).
+	if pending, countErr := db.PendingForwardCount(); countErr == nil && pending > 0 {
+		summary, replayErr := replayOutbox(context.Background(), inboundForwards, db, profile, os.Getenv("AETHER_INGRESS_TOKEN"))
+		if replayErr != nil {
+			fmt.Printf("[receiver] replay outbox for profile %s: %v\n", metricProfile(profile), replayErr)
+		} else if summary.Replayed > 0 {
+			fmt.Printf("[receiver] replayed %d pending forward(s) for profile %s\n", summary.Replayed, metricProfile(profile))
+		}
+	}
 	return db
 }
 
@@ -159,6 +170,12 @@ func handleSignalReceiver(args []string) {
 		signalAccount = os.Getenv("SIGNAL_ACCOUNT")
 	}
 
+	// Warm the active account's DB so pending forwards are replayed at startup,
+	// not only when the next webhook arrives (A07).
+	if signalAccount != "" {
+		dbForAccount(signalAccount)
+	}
+
 	// The WebSocket subscriber goroutine keeps a persistent connection to
 	// /v1/receive/{account}.  Without an active subscriber the container
 	// never tells signal-cli to start delivering, so RECEIVE_WEBHOOK_URL
@@ -184,9 +201,9 @@ func handleSignalReceiver(args []string) {
 }
 
 // newWebhookHandler builds the signal-cli webhook endpoint. save performs the
-// DB write and enqueues any forward; it is injected so tests can prove the ACK
-// does not wait on forwarding.
-func newWebhookHandler(save func(SignalWebhookPayload)) http.Handler {
+// durable DB and outbox write; it returns an error so the ACK waits for that
+// write while never waiting on forwarding (A03, A07).
+func newWebhookHandler(save func(SignalWebhookPayload) error) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			fmt.Printf("[receiver] unexpected method %s on webhook\n", r.Method)
@@ -211,7 +228,10 @@ func newWebhookHandler(save func(SignalWebhookPayload)) http.Handler {
 
 		if save != nil {
 			for _, p := range payloads {
-				save(p)
+				if err := save(p); err != nil {
+					http.Error(w, "Error saving message", http.StatusInternalServerError)
+					return
+				}
 			}
 		}
 
@@ -265,10 +285,10 @@ func normalizeGroupID(id string) string {
 }
 
 // saveSignalPayload extracts and persists a message from a webhook/WebSocket payload.
-func saveSignalPayload(p SignalWebhookPayload) {
+func saveSignalPayload(p SignalWebhookPayload) error {
 	db := dbForAccount(p.Account)
 	if db == nil {
-		return
+		return fmt.Errorf("no database for account %s", p.Account)
 	}
 
 	var msg client.Message
@@ -295,7 +315,7 @@ func saveSignalPayload(p SignalWebhookPayload) {
 		}
 		client.UpdateReactionInAllDBs(convID, rxn.TargetSentTimestamp, rxn.Emoji, senderName, rxn.Remove)
 		fmt.Printf("[receiver] reaction %s on ts=%d in conv %s\n", rxn.Emoji, rxn.TargetSentTimestamp, convID)
-		return
+		return nil
 	}
 
 	if p.Envelope.DataMessage != nil &&
@@ -354,7 +374,7 @@ func saveSignalPayload(p SignalWebhookPayload) {
 			}
 			client.UpdateReactionInAllDBs(convID, rxn.TargetSentTimestamp, rxn.Emoji, "Me", rxn.Remove)
 			fmt.Printf("[receiver] sync reaction %s on ts=%d in conv %s\n", rxn.Emoji, rxn.TargetSentTimestamp, convID)
-			return
+			return nil
 		}
 
 		convID = sent.Destination
@@ -383,26 +403,53 @@ func saveSignalPayload(p SignalWebhookPayload) {
 			TimestampMS:  ts,
 		}
 	} else {
-		return
+		return nil
 	}
 
-	if err := db.SaveMessage(msg, convID, attachments); err != nil {
-		fmt.Printf("[receiver] error saving message: %v\n", err)
-	} else {
-		typeStr := "incoming"
-		if msg.IsFromMe {
-			typeStr = "sync-sent"
-		}
-		fmt.Printf("[receiver] saved %s message for conv %s (account %s, message %s)\n",
-			typeStr, convID, p.Account, msg.MessageID)
-	}
-
-	// Forward only after the DB write, using the sending account's profile. The
-	// config is re-read per message so forwarding can be toggled without a
-	// restart. Forwarding is best-effort and never changes the success path.
+	// Decide whether this message is forwardable before the write so the
+	// message and outbox row commit atomically before the ACK (A07).
+	var outbox *client.ForwardOutboxEntry
 	if inbound != nil && strings.TrimSpace(inbound.Sender) != "" && strings.TrimSpace(inbound.Text) != "" {
-		forwardInbound(context.Background(), p.Account, *inbound)
+		profile, url, enabled, err := resolveForwardTarget(p.Account)
+		if err != nil {
+			fmt.Printf("[receiver] forwarding config for profile %s message %s: %v\n",
+				metricProfile(profile), inbound.MessageID, err)
+		} else if enabled {
+			entry, marshalErr := forwardOutboxEntry(profile, url, *inbound, time.Now())
+			if marshalErr != nil {
+				fmt.Printf("[receiver] forwarding outbox for profile %s message %s: %v\n",
+					metricProfile(profile), inbound.MessageID, marshalErr)
+			} else {
+				outbox = entry
+			}
+		}
 	}
+
+	inserted, err := db.SaveMessageWithForward(msg, convID, attachments, outbox)
+	if err != nil {
+		fmt.Printf("[receiver] error saving message: %v\n", err)
+		return err
+	}
+
+	typeStr := "incoming"
+	if msg.IsFromMe {
+		typeStr = "sync-sent"
+	}
+	fmt.Printf("[receiver] saved %s message for conv %s (account %s, message %s)\n",
+		typeStr, convID, p.Account, msg.MessageID)
+
+	// Hand the durable row to the bounded worker. A full or closed queue leaves
+	// it pending for the next replay instead of losing it (A07).
+	if outbox != nil && inserted {
+		inboundForwards.EnqueueDurable(db, outbox.Profile, outbox.URL,
+			os.Getenv("AETHER_INGRESS_TOKEN"), *inbound, outbox.MessageID)
+	}
+	if outbox != nil {
+		if pending, countErr := db.PendingForwardCount(); countErr == nil {
+			inboundForwards.metrics.SetOutboxPending(outbox.Profile, pending)
+		}
+	}
+	return nil
 }
 
 // startAllAccountSubscribers queries /v1/accounts on the Signal API and starts
@@ -558,10 +605,12 @@ func wsReadLoop(wsURL string) error {
 		case 0x9: // ping — respond with pong
 			wsSendPong(conn, payload)
 		case 0x1, 0x2: // text or binary — a Signal message
-			fmt.Printf("[receiver] websocket frame (%d bytes): %s\n", len(payload), string(payload))
+			fmt.Printf("[receiver] websocket frame (%d bytes)\n", len(payload))
 			payloads := parseSignalPayloads(payload)
 			for _, p := range payloads {
-				saveSignalPayload(p)
+				if err := saveSignalPayload(p); err != nil {
+					fmt.Printf("[receiver] websocket save: %v\n", err)
+				}
 			}
 		}
 	}
