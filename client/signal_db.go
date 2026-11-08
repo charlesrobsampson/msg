@@ -44,7 +44,19 @@ func OpenSignalDBAt(path string) (*SignalDB, error) {
 		}
 	}
 
-	db, err := sql.Open("sqlite", path)
+	// WAL lets the receiver and Aether (separate processes) read while the
+	// other writes, and the busy timeout makes concurrent writers wait for the
+	// lock instead of failing the save with SQLITE_BUSY. Both pragmas are
+	// applied to every pooled connection by the sqlite driver.
+	dsn := path
+	if strings.Contains(dsn, "?") {
+		dsn += "&"
+	} else {
+		dsn += "?"
+	}
+	dsn += "_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open signal cache db: %v", err)
 	}

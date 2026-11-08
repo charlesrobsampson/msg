@@ -71,3 +71,30 @@ func TestForwardOutboxPersistence(t *testing.T) {
 		t.Fatalf("pending rows after delete = %d, want 0", len(pending))
 	}
 }
+
+// TestSignalDBPragmas proves cross-process writers wait for the lock instead
+// of failing, and that WAL mode is enabled so readers never block the receiver
+// mid-save.
+func TestSignalDBPragmas(t *testing.T) {
+	db, err := OpenSignalDBAt(filepath.Join(t.TempDir(), "cache.db"))
+	if err != nil {
+		t.Fatalf("OpenSignalDBAt: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	var mode string
+	if err := db.db.QueryRow("PRAGMA journal_mode").Scan(&mode); err != nil {
+		t.Fatalf("PRAGMA journal_mode: %v", err)
+	}
+	if mode != "wal" {
+		t.Fatalf("journal_mode = %q, want wal", mode)
+	}
+
+	var timeout int
+	if err := db.db.QueryRow("PRAGMA busy_timeout").Scan(&timeout); err != nil {
+		t.Fatalf("PRAGMA busy_timeout: %v", err)
+	}
+	if timeout != 5000 {
+		t.Fatalf("busy_timeout = %d, want 5000", timeout)
+	}
+}
