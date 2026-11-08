@@ -105,7 +105,22 @@ func dbForAccount(account string) *client.SignalDB {
 	return db
 }
 
-func handleSignalReceiver(_ []string) {
+func handleSignalReceiver(args []string) {
+	metricsAddr := defaultMetricsAddr
+	for i := 0; i < len(args); i++ {
+		switch {
+		case args[i] == "--metrics-addr":
+			if i+1 < len(args) {
+				metricsAddr = args[i+1]
+				i++
+			} else {
+				metricsAddr = ""
+			}
+		case strings.HasPrefix(args[i], "--metrics-addr="):
+			metricsAddr = strings.TrimPrefix(args[i], "--metrics-addr=")
+		}
+	}
+
 	port := 7008
 	if envPort := os.Getenv("MSG_SIGNAL_RECEIVER_PORT"); envPort != "" {
 		if p, err := strconv.Atoi(envPort); err == nil {
@@ -113,6 +128,14 @@ func handleSignalReceiver(_ []string) {
 		}
 	}
 	addr := fmt.Sprintf("0.0.0.0:%d", port)
+
+	metricsBound, stopMetrics, metricsErr := startMetricsServer(metricsAddr, forwardMetrics)
+	if metricsErr != nil {
+		fmt.Printf("[metrics] listen %s: %v\n", metricsAddr, metricsErr)
+	} else if metricsBound != "" {
+		defer stopMetrics()
+		fmt.Printf("Metrics listening on %s...\n", metricsBound)
+	}
 
 	// Determine Signal API base URL and account from config so we can
 	// maintain the WebSocket subscription that activates message delivery.
@@ -177,7 +200,7 @@ func newWebhookHandler(save func(SignalWebhookPayload)) http.Handler {
 			return
 		}
 
-		fmt.Printf("[receiver] webhook payload (%d bytes): %s\n", len(body), string(body))
+		fmt.Printf("[receiver] webhook payload (%d bytes)\n", len(body))
 
 		payloads := parseSignalPayloads(body)
 		if payloads == nil {
@@ -370,7 +393,8 @@ func saveSignalPayload(p SignalWebhookPayload) {
 		if msg.IsFromMe {
 			typeStr = "sync-sent"
 		}
-		fmt.Printf("[receiver] saved %s message for conv %s (account %s)\n", typeStr, convID, p.Account)
+		fmt.Printf("[receiver] saved %s message for conv %s (account %s, message %s)\n",
+			typeStr, convID, p.Account, msg.MessageID)
 	}
 
 	// Forward only after the DB write, using the sending account's profile. The

@@ -49,6 +49,12 @@ type Forwarder struct {
 	BaseDelay   time.Duration
 	Sleep       func(time.Duration)
 	Logf        func(format string, args ...any)
+	// Profile is the sending account/profile, used only for metric labels and
+	// log correlation. Empty means "default".
+	Profile string
+	// Metrics receives attempt, duration, and drop observations. Nil disables
+	// instrumentation (direct callers and tests).
+	Metrics *Metrics
 }
 
 // defaultForwardHTTPClient is shared by every forwarder so per-message
@@ -68,7 +74,7 @@ func NewForwarder(url, token string) *Forwarder {
 
 // inboundForwards is the receiver-wide, bounded per-account forward queue. It
 // is enqueued after the DB write, so the webhook ACK never waits on Aether.
-var inboundForwards = NewForwardQueue(defaultForwardQueueDepth)
+var inboundForwards = NewForwardQueueWithMetrics(defaultForwardQueueDepth, forwardMetrics)
 
 // forwardInbound hands one normalized message to the sending account's
 // per-profile worker when that profile has opted in. The config is re-read for
@@ -82,9 +88,15 @@ func forwardInbound(ctx context.Context, account string, msg ForwardMessage) {
 			return
 		}
 	}
+	// Queue workers and metric labels are keyed by profile name, never by the
+	// account: phone numbers must not become Prometheus labels (plan §3.19).
+	profile, err := client.FindProfileForAccount(account)
+	if err != nil {
+		profile = client.GetProfile()
+	}
 	target, err := client.ForwardingForAccount(account)
 	if err != nil {
-		fmt.Printf("[receiver] forwarding config for account %s: %v\n", account, err)
+		fmt.Printf("[receiver] forwarding config for profile %s message %s: %v\n", metricProfile(profile), msg.MessageID, err)
 		return
 	}
 	if !target.Enabled {
@@ -92,11 +104,11 @@ func forwardInbound(ctx context.Context, account string, msg ForwardMessage) {
 	}
 	url := strings.TrimSpace(target.URL)
 	if url == "" {
-		fmt.Printf("[receiver] forwarding enabled for account %s but no url is configured\n", account)
+		fmt.Printf("[receiver] forwarding enabled for profile %s but no url is configured (message %s)\n", metricProfile(profile), msg.MessageID)
 		return
 	}
 
-	inboundForwards.Enqueue(account, url, os.Getenv("AETHER_INGRESS_TOKEN"), msg)
+	inboundForwards.Enqueue(profile, url, os.Getenv("AETHER_INGRESS_TOKEN"), msg)
 }
 
 // forwardJob is one queued delivery. The URL and token are resolved at enqueue
@@ -111,13 +123,14 @@ type forwardWorker struct {
 	jobs chan forwardJob
 }
 
-// ForwardQueue is a bounded queue with one worker per account (and therefore
-// per profile), which preserves per-profile forward order. Enqueue never
-// blocks; a saturated queue drops the newest job and increments Dropped.
+// ForwardQueue is a bounded queue with one worker per profile, which preserves
+// per-profile forward order. Enqueue never blocks; a saturated queue drops the
+// newest job and increments Dropped.
 type ForwardQueue struct {
 	depth        int
 	newForwarder func(url, token string) *Forwarder
 	logf         func(format string, args ...any)
+	metrics      *Metrics
 
 	mu      sync.Mutex
 	workers map[string]*forwardWorker
@@ -129,12 +142,22 @@ type ForwardQueue struct {
 // NewForwardQueue returns a queue with the given per-profile depth. A
 // non-positive depth selects the default (64).
 func NewForwardQueue(depth int) *ForwardQueue {
+	return NewForwardQueueWithMetrics(depth, forwardMetrics)
+}
+
+// NewForwardQueueWithMetrics returns a queue that reports to the given
+// registry. Tests use this to keep registries isolated.
+func NewForwardQueueWithMetrics(depth int, metrics *Metrics) *ForwardQueue {
 	if depth <= 0 {
 		depth = defaultForwardQueueDepth
+	}
+	if metrics == nil {
+		metrics = forwardMetrics
 	}
 	return &ForwardQueue{
 		depth:        depth,
 		newForwarder: NewForwarder,
+		metrics:      metrics,
 		logf: func(format string, args ...any) {
 			fmt.Printf("[forward] "+format+"\n", args...)
 		},
@@ -143,31 +166,39 @@ func NewForwardQueue(depth int) *ForwardQueue {
 }
 
 // Enqueue offers one job without blocking. It returns false when the profile's
-// buffer is full or the queue is closed.
-func (q *ForwardQueue) Enqueue(account, url, token string, msg ForwardMessage) bool {
+// buffer is full or the queue is closed. The profile name is used both as the
+// worker key and as the metric label; callers must never pass an account or any
+// other unbounded/PII value.
+func (q *ForwardQueue) Enqueue(profile, url, token string, msg ForwardMessage) bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
 	if q.closed {
 		q.dropped.Add(1)
-		q.logf("forward queue closed for account %s; dropping message %s", account, msg.MessageID)
+		q.metrics.RecordDropped(profile, DropShutdown)
+		q.logf("forward queue closed for profile %s; dropping message %s", metricProfile(profile), msg.MessageID)
 		return false
 	}
 
-	worker := q.workers[account]
+	worker := q.workers[profile]
 	if worker == nil {
 		worker = &forwardWorker{jobs: make(chan forwardJob, q.depth)}
-		q.workers[account] = worker
+		q.workers[profile] = worker
+		q.metrics.SetQueueDepth(profile, 0)
 		q.wg.Add(1)
-		go q.run(worker)
+		go q.run(worker, profile)
 	}
 
 	select {
 	case worker.jobs <- forwardJob{url: url, token: token, msg: msg}:
+		q.metrics.SetQueueDepth(profile, len(worker.jobs))
 		return true
 	default:
 		q.dropped.Add(1)
-		q.logf("forward queue full for account %s; dropping message %s", account, msg.MessageID)
+		q.metrics.RecordDropped(profile, DropQueueFull)
+		q.metrics.RecordAttempt(profile, AttemptQueueFull, 0)
+		q.metrics.SetQueueDepth(profile, len(worker.jobs))
+		q.logf("forward queue full for profile %s; dropping message %s", metricProfile(profile), msg.MessageID)
 		return false
 	}
 }
@@ -194,12 +225,15 @@ func (q *ForwardQueue) Close() {
 	q.wg.Wait()
 }
 
-func (q *ForwardQueue) run(worker *forwardWorker) {
+func (q *ForwardQueue) run(worker *forwardWorker, profile string) {
 	defer q.wg.Done()
 	for job := range worker.jobs {
+		q.metrics.SetQueueDepth(profile, len(worker.jobs))
 		forwarder := q.newForwarder(job.url, job.token)
+		forwarder.Profile = profile
+		forwarder.Metrics = q.metrics
 		if err := forwarder.Forward(context.Background(), job.msg); err != nil {
-			q.logf("forward failed for message %s: %v", job.msg.MessageID, err)
+			q.logf("forward failed for profile %s message %s: %v", metricProfile(profile), job.msg.MessageID, err)
 		}
 	}
 }
@@ -237,12 +271,20 @@ func (f *Forwarder) Forward(ctx context.Context, msg ForwardMessage) error {
 		}
 
 		made = attempt
+		start := time.Now()
 		lastErr = f.post(ctx, msg)
+		elapsed := time.Since(start)
 		if lastErr == nil {
+			f.recordAttempt(AttemptOK, elapsed)
 			return nil
 		}
 
 		retryable, retryAfter := shouldRetryForward(lastErr)
+		if retryable {
+			f.recordAttempt(AttemptRetryable, elapsed)
+		} else {
+			f.recordAttempt(AttemptTerminal, elapsed)
+		}
 		if !retryable || attempt == attempts {
 			break
 		}
@@ -251,13 +293,38 @@ func (f *Forwarder) Forward(ctx context.Context, msg ForwardMessage) error {
 		if retryAfter > wait {
 			wait = retryAfter
 		}
-		f.logf("attempt %d/%d to %s failed: %v; retrying in %s", attempt, attempts, f.URL, lastErr, wait)
+		f.logf("attempt %d/%d for profile %s message %s to %s failed: %v; retrying in %s",
+			attempt, attempts, f.profileLabel(), msg.MessageID, f.URL, lastErr, wait)
 		f.nap(wait)
 		delay = nextForwardDelay(delay)
 	}
 
-	f.logf("delivery to %s failed after %d attempt(s): %v", f.URL, made, lastErr)
+	f.recordDropped(DropTerminal)
+	f.logf("delivery to %s for profile %s message %s failed after %d attempt(s): %v",
+		f.URL, f.profileLabel(), msg.MessageID, made, lastErr)
 	return lastErr
+}
+
+// profileLabel keeps the metric label set bounded and non-empty.
+func (f *Forwarder) profileLabel() string {
+	if f == nil || strings.TrimSpace(f.Profile) == "" {
+		return "default"
+	}
+	return f.Profile
+}
+
+func (f *Forwarder) recordAttempt(result string, d time.Duration) {
+	if f == nil || f.Metrics == nil {
+		return
+	}
+	f.Metrics.RecordAttempt(f.profileLabel(), result, d)
+}
+
+func (f *Forwarder) recordDropped(reason string) {
+	if f == nil || f.Metrics == nil {
+		return
+	}
+	f.Metrics.RecordDropped(f.profileLabel(), reason)
 }
 
 // shouldRetryForward implements the shared retry classification: only network

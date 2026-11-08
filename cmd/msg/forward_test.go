@@ -366,6 +366,53 @@ func TestPerProfileForwarding(t *testing.T) {
 	})
 }
 
+// TestForwardProfileMetricLabel proves the forward metric label is the config
+// profile name, never the account phone number (plan §3.19).
+func TestForwardProfileMetricLabel(t *testing.T) {
+	t.Setenv("AETHER_INGRESS_TOKEN", "")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	account := "+15555550111"
+	arrived := make(chan struct{}, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		select {
+		case arrived <- struct{}{}:
+		default:
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	t.Cleanup(srv.Close)
+	writeForwardingConfig(t, home, "config-bob.json", account, true, srv.URL)
+
+	registry := NewMetrics()
+	queue := swapForwardQueueWithMetrics(t, 4, registry)
+	forwardInbound(context.Background(), account, ForwardMessage{
+		Sender:    "+15555550102",
+		Text:      "!test",
+		Provider:  "signal",
+		MessageID: "label-1",
+	})
+	select {
+	case <-arrived:
+	case <-time.After(2 * time.Second):
+		t.Fatal("enabled profile did not forward")
+	}
+	queue.Close()
+
+	if got := registry.Attempts("bob", AttemptOK); got != 1 {
+		t.Errorf("attempts{profile=bob,result=ok} = %d, want 1", got)
+	}
+	if got := registry.Attempts(account, AttemptOK); got != 0 {
+		t.Errorf("attempts{profile=%q} = %d, want 0; accounts must never be labels", account, got)
+	}
+	var exposition strings.Builder
+	registry.writeExposition(&exposition)
+	if strings.Contains(exposition.String(), account) {
+		t.Errorf("metrics exposition leaks the account phone number:\n%s", exposition.String())
+	}
+}
+
 // writeForwardingConfig writes one profile config under a temp HOME.
 func writeForwardingConfig(t *testing.T, home, filename, account string, enabled bool, url string) {
 	t.Helper()
@@ -383,8 +430,15 @@ func writeForwardingConfig(t *testing.T, home, filename, account string, enabled
 // and restores (and drains) it when the test ends.
 func swapForwardQueue(t *testing.T, depth int) *ForwardQueue {
 	t.Helper()
+	return swapForwardQueueWithMetrics(t, depth, forwardMetrics)
+}
+
+// swapForwardQueueWithMetrics is swapForwardQueue with an isolated registry so
+// metric assertions do not observe the process-wide default.
+func swapForwardQueueWithMetrics(t *testing.T, depth int, registry *Metrics) *ForwardQueue {
+	t.Helper()
 	previous := inboundForwards
-	queue := NewForwardQueue(depth)
+	queue := NewForwardQueueWithMetrics(depth, registry)
 	inboundForwards = queue
 	t.Cleanup(func() {
 		queue.Close()
@@ -531,4 +585,191 @@ func TestForwardQueueFullDoesNotBlock(t *testing.T) {
 		t.Fatalf("dropped forwards = %d, want 1", got)
 	}
 	openGate()
+}
+
+// TestForwardMetrics proves the profile-labeled attempt, duration, depth, and
+// dropped families move with the forward worker, and that terminal failures are
+// distinguishable from retryable ones (plan §3.19).
+func TestForwardMetrics(t *testing.T) {
+	const profile = "work"
+
+	message := func(id string) ForwardMessage {
+		return ForwardMessage{
+			Sender:    "+15555550102",
+			Text:      "!test",
+			Provider:  "signal",
+			MessageID: id,
+		}
+	}
+
+	t.Run("terminal 401", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+		}))
+		defer server.Close()
+
+		registry := NewMetrics()
+		queue := NewForwardQueueWithMetrics(4, registry)
+		queue.newForwarder = func(url, token string) *Forwarder {
+			forwarder := NewForwarder(url, token)
+			forwarder.Sleep = func(time.Duration) { t.Fatal("sleep after a terminal 401") }
+			forwarder.Logf = func(string, ...any) {}
+			return forwarder
+		}
+
+		if ok := queue.Enqueue(profile, server.URL, "", message("terminal-1")); !ok {
+			t.Fatal("Enqueue rejected a healthy queue")
+		}
+		queue.Close()
+
+		if got := registry.Attempts(profile, AttemptTerminal); got != 1 {
+			t.Errorf("attempts{profile,result=terminal} = %d, want 1", got)
+		}
+		if got := registry.Attempts(profile, AttemptRetryable); got != 0 {
+			t.Errorf("attempts{profile,result=retryable} = %d, want 0", got)
+		}
+		if got := registry.Dropped(profile, DropTerminal); got != 1 {
+			t.Errorf("dropped{profile,reason=terminal} = %d, want 1", got)
+		}
+		if _, count := registry.Duration(profile, AttemptTerminal); count != 1 {
+			t.Errorf("duration{profile,result=terminal} count = %d, want 1", count)
+		}
+		if got := registry.QueueDepth(profile); got != 0 {
+			t.Errorf("queue depth after close = %d, want 0", got)
+		}
+	})
+
+	t.Run("retryable 503", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+		}))
+		defer server.Close()
+
+		registry := NewMetrics()
+		queue := NewForwardQueueWithMetrics(4, registry)
+		queue.newForwarder = func(url, token string) *Forwarder {
+			forwarder := NewForwarder(url, token)
+			forwarder.MaxAttempts = 3
+			forwarder.BaseDelay = time.Millisecond
+			forwarder.Sleep = func(time.Duration) {}
+			forwarder.Logf = func(string, ...any) {}
+			return forwarder
+		}
+
+		if ok := queue.Enqueue(profile, server.URL, "", message("retry-1")); !ok {
+			t.Fatal("Enqueue rejected a healthy queue")
+		}
+		queue.Close()
+
+		if got := registry.Attempts(profile, AttemptRetryable); got != 3 {
+			t.Errorf("attempts{profile,result=retryable} = %d, want 3", got)
+		}
+		if got := registry.Dropped(profile, DropTerminal); got != 1 {
+			t.Errorf("dropped{profile,reason=terminal} = %d, want 1 after exhausted retries", got)
+		}
+	})
+
+	t.Run("queue full", func(t *testing.T) {
+		started := make(chan struct{}, 1)
+		release := make(chan struct{})
+		var releaseOnce sync.Once
+		releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			<-release
+			w.WriteHeader(http.StatusAccepted)
+		}))
+		t.Cleanup(server.Close)
+
+		registry := NewMetrics()
+		queue := NewForwardQueueWithMetrics(1, registry)
+		t.Cleanup(queue.Close)
+		t.Cleanup(releaseAll)
+
+		if ok := queue.Enqueue(profile, server.URL, "", message("full-1")); !ok {
+			t.Fatal("Enqueue rejected a healthy queue")
+		}
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("forward worker did not start")
+		}
+		// The worker consumed full-1, so one buffered job fills the depth-1
+		// queue and the next Enqueue is rejected.
+		if ok := queue.Enqueue(profile, server.URL, "", message("full-2")); !ok {
+			t.Fatal("Enqueue rejected a queue with capacity")
+		}
+		if ok := queue.Enqueue(profile, server.URL, "", message("full-3")); ok {
+			t.Fatal("Enqueue accepted a message into a full queue")
+		}
+		if got := registry.Attempts(profile, AttemptQueueFull); got != 1 {
+			t.Errorf("attempts{profile,result=queue_full} = %d, want 1", got)
+		}
+		if got := registry.Dropped(profile, DropQueueFull); got != 1 {
+			t.Errorf("dropped{profile,reason=queue_full} = %d, want 1", got)
+		}
+
+		releaseAll()
+		queue.Close()
+	})
+
+	t.Run("depth", func(t *testing.T) {
+		started := make(chan struct{}, 1)
+		release := make(chan struct{})
+		var releaseOnce sync.Once
+		releaseAll := func() { releaseOnce.Do(func() { close(release) }) }
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			select {
+			case started <- struct{}{}:
+			default:
+			}
+			<-release
+			w.WriteHeader(http.StatusAccepted)
+		}))
+		t.Cleanup(server.Close)
+
+		registry := NewMetrics()
+		queue := NewForwardQueueWithMetrics(2, registry)
+		t.Cleanup(queue.Close)
+		t.Cleanup(releaseAll)
+
+		if ok := queue.Enqueue(profile, server.URL, "", message("depth-1")); !ok {
+			t.Fatal("Enqueue rejected a healthy queue")
+		}
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("forward worker did not start")
+		}
+		if ok := queue.Enqueue(profile, server.URL, "", message("depth-2")); !ok {
+			t.Fatal("Enqueue rejected a queue with capacity")
+		}
+		if got := registry.QueueDepth(profile); got != 1 {
+			t.Errorf("queue depth = %d, want 1", got)
+		}
+
+		releaseAll()
+		queue.Close()
+		if got := registry.QueueDepth(profile); got != 0 {
+			t.Errorf("queue depth after close = %d, want 0", got)
+		}
+	})
+
+	t.Run("shutdown", func(t *testing.T) {
+		registry := NewMetrics()
+		queue := NewForwardQueueWithMetrics(2, registry)
+		queue.Close()
+
+		if ok := queue.Enqueue(profile, "http://example.invalid", "", message("closed-1")); ok {
+			t.Fatal("Enqueue accepted a message after Close")
+		}
+		if got := registry.Dropped(profile, DropShutdown); got != 1 {
+			t.Errorf("dropped{profile,reason=shutdown} = %d, want 1", got)
+		}
+	})
 }
