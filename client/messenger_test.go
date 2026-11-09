@@ -228,3 +228,76 @@ func TestProviderStatusError(t *testing.T) {
 		}
 	})
 }
+
+func TestMessengerReact(t *testing.T) {
+	t.Run("signal posts a reaction to the target message", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+
+		type captured struct {
+			path string
+			body map[string]any
+		}
+		requests := make(chan captured, 1)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Errorf("decoding reaction body: %v", err)
+			}
+			requests <- captured{path: r.URL.Path, body: body}
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer srv.Close()
+
+		m, err := NewMessenger(MessengerConfig{
+			Provider: "signal",
+			Account:  "+15555550100",
+			BaseURL:  srv.URL,
+			DBPath:   filepath.Join(t.TempDir(), "signal-cache.db"),
+		})
+		if err != nil {
+			t.Fatalf("NewMessenger() error = %v", err)
+		}
+		if err := m.React(context.Background(), ReactionRequest{
+			Recipient:         "b9e8dd13-2ab7-4ced-9375-822dc29e548f",
+			TargetAuthor:      "b9e8dd13-2ab7-4ced-9375-822dc29e548f",
+			TargetTimestampMS: 1794150453095,
+			Emoji:             "👍",
+		}); err != nil {
+			t.Fatalf("React() error = %v", err)
+		}
+
+		select {
+		case got := <-requests:
+			if got.body["reaction"] != "👍" {
+				t.Errorf("reaction = %v, want 👍", got.body["reaction"])
+			}
+			if got.body["recipient"] != "b9e8dd13-2ab7-4ced-9375-822dc29e548f" {
+				t.Errorf("recipient = %v", got.body["recipient"])
+			}
+			if got.body["target_author"] != "b9e8dd13-2ab7-4ced-9375-822dc29e548f" {
+				t.Errorf("target_author = %v", got.body["target_author"])
+			}
+			if got.body["timestamp"] != float64(1794150453095) {
+				t.Errorf("timestamp = %v", got.body["timestamp"])
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("reaction endpoint was not called")
+		}
+	})
+
+	t.Run("provider without reactions", func(t *testing.T) {
+		m := &providerMessenger{provider: stubProvider{}, name: "stub"}
+		err := m.React(context.Background(), ReactionRequest{Recipient: "+1", TargetTimestampMS: 1, Emoji: "👍"})
+		if !errors.Is(err, ErrReactionsUnsupported) {
+			t.Fatalf("React() error = %v, want ErrReactionsUnsupported", err)
+		}
+	})
+
+	t.Run("timestamp is required", func(t *testing.T) {
+		m := &providerMessenger{provider: stubProvider{}, name: "stub"}
+		if err := m.React(context.Background(), ReactionRequest{}); err == nil {
+			t.Fatal("React() accepted an empty reaction")
+		}
+	})
+}

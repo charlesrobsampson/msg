@@ -51,11 +51,12 @@ func TestForwardInbound(t *testing.T) {
 		f.Logf = func(string, ...any) {}
 
 		want := ForwardMessage{
-			Sender:    "+15555550102",
-			Text:      "!test",
-			Provider:  "signal",
-			GroupID:   "group.abc123",
-			MessageID: "rcv-1700000000000-+15555550102",
+			Sender:      "+15555550102",
+			Text:        "!test",
+			Provider:    "signal",
+			GroupID:     "group.abc123",
+			MessageID:   "rcv-1700000000000-+15555550102",
+			TimestampMS: 1700000000000,
 		}
 		if err := f.Forward(context.Background(), want); err != nil {
 			t.Fatalf("Forward() error = %v", err)

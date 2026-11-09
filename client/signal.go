@@ -487,8 +487,18 @@ func (p *SignalProvider) findNumberByName(name string) string {
 }
 
 func (p *SignalProvider) SendReaction(conversationID string, msg Message, emoji string, remove bool) (bool, error) {
+	return p.SendReactionContext(context.Background(), conversationID, msg, emoji, remove)
+}
+
+// SendReactionContext is SendReaction with caller-controlled cancellation. The
+// Messenger facade uses it so one slow provider call cannot outlive the
+// outbound queue's per-attempt deadline.
+func (p *SignalProvider) SendReactionContext(ctx context.Context, conversationID string, msg Message, emoji string, remove bool) (bool, error) {
 	if p.account == "" {
 		return false, fmt.Errorf("SIGNAL_ACCOUNT not set")
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
 	}
 
 	var targetAuthor string
@@ -529,12 +539,12 @@ func (p *SignalProvider) SendReaction(conversationID string, msg Message, emoji 
 		}
 		jsonPayload, _ = json.Marshal(payload)
 		endpoint = fmt.Sprintf("%s/v1/reactions/%s", p.baseURL, url.PathEscape(p.account))
-		req, err := http.NewRequest(http.MethodDelete, endpoint, bytes.NewBuffer(jsonPayload))
+		req, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, bytes.NewBuffer(jsonPayload))
 		if err != nil {
 			return false, err
 		}
 		req.Header.Set("Content-Type", "application/json")
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := p.client().Do(req)
 		if err != nil {
 			p.unreachable = true
 			return false, err
@@ -557,7 +567,7 @@ func (p *SignalProvider) SendReaction(conversationID string, msg Message, emoji 
 	}
 	jsonPayload, _ = json.Marshal(payload)
 	endpoint = fmt.Sprintf("%s/v1/reactions/%s", p.baseURL, url.PathEscape(p.account))
-	resp, err := doRequest(context.Background(), p.client(), http.MethodPost, endpoint, jsonPayload, "application/json")
+	resp, err := doRequest(ctx, p.client(), http.MethodPost, endpoint, jsonPayload, "application/json")
 	if err != nil {
 		p.unreachable = true
 		return false, err

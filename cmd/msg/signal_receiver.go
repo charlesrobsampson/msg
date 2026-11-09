@@ -354,10 +354,11 @@ func saveSignalPayload(p SignalWebhookPayload) error {
 		}
 
 		inbound = &ForwardMessage{
-			Sender:    source,
-			Text:      p.Envelope.DataMessage.Message,
-			Provider:  "signal",
-			MessageID: msg.MessageID,
+			Sender:      source,
+			Text:        p.Envelope.DataMessage.Message,
+			Provider:    "signal",
+			MessageID:   msg.MessageID,
+			TimestampMS: msg.TimestampMS,
 		}
 		if p.Envelope.DataMessage.GroupInfo != nil && p.Envelope.DataMessage.GroupInfo.GroupID != "" {
 			inbound.GroupID = normalizeGroupID(p.Envelope.DataMessage.GroupInfo.GroupID)

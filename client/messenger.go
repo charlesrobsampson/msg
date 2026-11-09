@@ -3,6 +3,7 @@ package client
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -40,11 +41,28 @@ func doRequest(ctx context.Context, client *http.Client, method, url string, bod
 	return client.Do(req)
 }
 
+// ErrReactionsUnsupported is returned when a provider cannot attach a reaction
+// to an existing message. Callers may fall back to a text acknowledgement.
+var ErrReactionsUnsupported = errors.New("client: provider does not support reactions")
+
+// Reaction targets one existing message. Recipient is a phone number or a
+// provider-specific conversation ID (a group ID for groups). TargetAuthor is
+// the author of the target message, and TargetTimestampMS is its provider
+// timestamp.
+type ReactionRequest struct {
+	Recipient         string
+	TargetAuthor      string
+	TargetTimestampMS int64
+	Emoji             string
+	Remove            bool
+}
+
 // Messenger is the narrow send-only facade consumed by Aether. It deliberately
 // avoids the CLI/TUI's global provider registry so multiple providers and
 // profiles can coexist without changing existing UX.
 type Messenger interface {
 	Send(ctx context.Context, recipient, text string) error
+	React(ctx context.Context, reaction ReactionRequest) error
 	Name() string
 }
 
@@ -120,4 +138,48 @@ func (m *providerMessenger) Send(ctx context.Context, recipient, text string) er
 
 func (m *providerMessenger) Name() string {
 	return m.name
+}
+
+// reactionSender is the optional provider extension that attaches reactions.
+type reactionSender interface {
+	SendReaction(conversationID string, msg Message, emoji string, remove bool) (bool, error)
+}
+
+// contextReactionSender is the cancellation-aware variant. Providers that
+// implement it are preferred so a reaction respects the queue's attempt
+// deadline.
+type contextReactionSender interface {
+	SendReactionContext(ctx context.Context, conversationID string, msg Message, emoji string, remove bool) (bool, error)
+}
+
+func (m *providerMessenger) React(ctx context.Context, reaction ReactionRequest) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if strings.TrimSpace(reaction.Emoji) == "" {
+		return errors.New("client: reaction emoji is empty")
+	}
+	if reaction.TargetTimestampMS == 0 {
+		return errors.New("client: reaction target timestamp is required")
+	}
+
+	target := Message{SenderNumber: reaction.TargetAuthor, TimestampMS: reaction.TargetTimestampMS}
+	var (
+		ok  bool
+		err error
+	)
+	if sender, supported := m.provider.(contextReactionSender); supported {
+		ok, err = sender.SendReactionContext(ctx, reaction.Recipient, target, reaction.Emoji, reaction.Remove)
+	} else if sender, supported := m.provider.(reactionSender); supported {
+		ok, err = sender.SendReaction(reaction.Recipient, target, reaction.Emoji, reaction.Remove)
+	} else {
+		return ErrReactionsUnsupported
+	}
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("client: %s rejected reaction to %s", m.name, reaction.Recipient)
+	}
+	return nil
 }
