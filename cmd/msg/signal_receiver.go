@@ -320,9 +320,9 @@ func saveSignalPayload(p SignalWebhookPayload) error {
 
 	if p.Envelope.DataMessage != nil &&
 		(p.Envelope.DataMessage.Message != "" || len(p.Envelope.DataMessage.Attachments) > 0) {
-		source := p.Envelope.Source
+		source := p.Envelope.SourceNumber
 		if source == "" {
-			source = p.Envelope.SourceNumber
+			source = p.Envelope.Source
 		}
 		if source == "" {
 			source = p.Envelope.SourceUUID
@@ -347,18 +347,24 @@ func saveSignalPayload(p SignalWebhookPayload) error {
 		msg = client.Message{
 			MessageID:    fmt.Sprintf("rcv-%d-%s", ts, source),
 			SenderName:   p.Envelope.SourceName,
-			SenderNumber: source, // resolved: Source → SourceNumber → SourceUUID
+			SenderNumber: source, // resolved: SourceNumber → Source → SourceUUID
 			Body:         p.Envelope.DataMessage.Message,
 			IsFromMe:     false,
 			TimestampMS:  ts,
 		}
 
+		senderNumber := p.Envelope.SourceNumber
+		if senderNumber == "" && strings.HasPrefix(source, "+") {
+			senderNumber = source
+		}
 		inbound = &ForwardMessage{
-			Sender:      source,
-			Text:        p.Envelope.DataMessage.Message,
-			Provider:    "signal",
-			MessageID:   msg.MessageID,
-			TimestampMS: msg.TimestampMS,
+			Sender:       source,
+			Text:         p.Envelope.DataMessage.Message,
+			Provider:     "signal",
+			MessageID:    msg.MessageID,
+			SenderName:   p.Envelope.SourceName,
+			SenderNumber: senderNumber,
+			TimestampMS:  msg.TimestampMS,
 		}
 		if p.Envelope.DataMessage.GroupInfo != nil && p.Envelope.DataMessage.GroupInfo.GroupID != "" {
 			inbound.GroupID = normalizeGroupID(p.Envelope.DataMessage.GroupInfo.GroupID)

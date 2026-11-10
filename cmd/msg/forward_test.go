@@ -519,6 +519,70 @@ func TestForwardDoesNotBlockWebhook(t *testing.T) {
 	unblock()
 }
 
+// TestSignalWebhookPrefersSourceNumber proves a Signal UUID sender is
+// forwarded with the phone number and display name when the envelope supplies
+// them, so Aether authorizes the identity a maintainer actually knows.
+func TestSignalWebhookPrefersSourceNumber(t *testing.T) {
+	const (
+		account = "+15555550303"
+		uuid    = "2aea5c40-0f8e-4ad7-8099-880b50064454"
+		phone   = "+18016739997"
+	)
+
+	t.Setenv("AETHER_INGRESS_TOKEN", "")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	arrived := make(chan ForwardMessage, 1)
+	forwardSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var msg ForwardMessage
+		if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
+			t.Errorf("decoding forwarded body: %v", err)
+		}
+		arrived <- msg
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	t.Cleanup(forwardSrv.Close)
+	writeForwardingConfig(t, home, "config.json", account, true, forwardSrv.URL)
+	swapForwardQueue(t, defaultForwardQueueDepth)
+	if dbForAccount(account) == nil {
+		t.Fatal("could not open the profile DB")
+	}
+
+	webhook := httptest.NewServer(newWebhookHandler(saveSignalPayload))
+	defer webhook.Close()
+
+	ts := int64(1700000000500)
+	body := fmt.Sprintf(`{"account":%q,"envelope":{"source":%q,"sourceNumber":%q,"sourceUuid":%q,"sourceName":"Tara Schick","timestamp":%d,"dataMessage":{"message":"!help","timestamp":%d}}}`,
+		account, uuid, phone, uuid, ts, ts)
+	resp, err := http.Post(webhook.URL, "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("post webhook: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("webhook status = %d, want 200", resp.StatusCode)
+	}
+
+	select {
+	case got := <-arrived:
+		if got.Sender != phone {
+			t.Errorf("Sender = %q, want phone %q", got.Sender, phone)
+		}
+		if got.SenderNumber != phone {
+			t.Errorf("SenderNumber = %q, want %q", got.SenderNumber, phone)
+		}
+		if got.SenderName != "Tara Schick" {
+			t.Errorf("SenderName = %q, want Tara Schick", got.SenderName)
+		}
+		if got.Text != "!help" {
+			t.Errorf("Text = %q, want !help", got.Text)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("forward never reached the fake Aether")
+	}
+}
+
 // TestForwardQueueFullDoesNotBlock proves a saturated forward queue drops the
 // newest message, counts it, and still ACKs the webhook immediately.
 func TestForwardQueueFullDoesNotBlock(t *testing.T) {

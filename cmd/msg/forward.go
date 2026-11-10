@@ -30,12 +30,14 @@ const (
 // ForwardMessage is the normalized inbound envelope POSTed to Aether's
 // /receive endpoint. It mirrors plan.md §3.2.
 type ForwardMessage struct {
-	Sender      string `json:"sender"`
-	Text        string `json:"text"`
-	Provider    string `json:"provider,omitempty"`
-	GroupID     string `json:"group_id,omitempty"`
-	MessageID   string `json:"message_id,omitempty"`
-	TimestampMS int64  `json:"timestamp_ms,omitempty"`
+	Sender       string `json:"sender"`
+	Text         string `json:"text"`
+	Provider     string `json:"provider,omitempty"`
+	GroupID      string `json:"group_id,omitempty"`
+	MessageID    string `json:"message_id,omitempty"`
+	SenderName   string `json:"sender_name,omitempty"`
+	SenderNumber string `json:"sender_number,omitempty"`
+	TimestampMS  int64  `json:"timestamp_ms,omitempty"`
 }
 
 // Forwarder posts inbound messages to Aether with a bounded number of retries
