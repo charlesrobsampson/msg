@@ -301,3 +301,49 @@ func TestMessengerReact(t *testing.T) {
 		}
 	})
 }
+
+func TestMessengerSendStyled(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	requests := make(chan SignalSendRequest, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body SignalSendRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decoding signal send body: %v", err)
+		}
+		requests <- body
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"timestamp":123}`))
+	}))
+	defer srv.Close()
+
+	m, err := NewMessenger(MessengerConfig{
+		Provider: "signal",
+		Account:  "+15555550100",
+		BaseURL:  srv.URL,
+		DBPath:   filepath.Join(t.TempDir(), "signal-cache.db"),
+	})
+	if err != nil {
+		t.Fatalf("NewMessenger() error = %v", err)
+	}
+	styled, ok := m.(StyledMessenger)
+	if !ok {
+		t.Fatal("signal messenger does not implement StyledMessenger")
+	}
+	if err := styled.SendStyled(context.Background(), "+15555550102", "*bold* and _italic_", true); err != nil {
+		t.Fatalf("SendStyled() error = %v", err)
+	}
+
+	select {
+	case got := <-requests:
+		if got.TextMode != "styled" {
+			t.Errorf("text_mode = %q, want styled", got.TextMode)
+		}
+		if got.Message != "*bold* and _italic_" {
+			t.Errorf("message = %q", got.Message)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("styled send was not delivered")
+	}
+}

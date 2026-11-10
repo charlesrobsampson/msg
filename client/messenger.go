@@ -66,6 +66,13 @@ type Messenger interface {
 	Name() string
 }
 
+// StyledMessenger is an optional capability. Providers that can render
+// provider-native formatting (Signal's text_mode=styled) implement it;
+// callers fall back to plain Send when they do not.
+type StyledMessenger interface {
+	SendStyled(ctx context.Context, recipient, text string, styled bool) error
+}
+
 // MessengerConfig configures a single Messenger.
 type MessengerConfig struct {
 	Provider string        // "signal" or "openmessage" (alias "sms")
@@ -115,6 +122,13 @@ type providerMessenger struct {
 }
 
 func (m *providerMessenger) Send(ctx context.Context, recipient, text string) error {
+	return m.SendStyled(ctx, recipient, text, false)
+}
+
+// SendStyled delivers text and, when supported, asks the provider to render
+// its native markup (Signal's *bold*, _italic_, ~strike~, ||spoiler||, and
+// `monospace`).
+func (m *providerMessenger) SendStyled(ctx context.Context, recipient, text string, styled bool) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -123,9 +137,9 @@ func (m *providerMessenger) Send(ctx context.Context, recipient, text string) er
 		err error
 	)
 	if sender, supported := m.provider.(contextSender); supported {
-		ok, err = sender.SendMessageContext(ctx, recipient, text, false)
+		ok, err = sender.SendMessageContext(ctx, recipient, text, styled)
 	} else {
-		ok, err = m.provider.SendMessage(recipient, text, false)
+		ok, err = m.provider.SendMessage(recipient, text, styled)
 	}
 	if err != nil {
 		return err
