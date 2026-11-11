@@ -130,3 +130,39 @@ func TestLooksLikeSignalUUID(t *testing.T) {
 		t.Error("non-UUID value was recognised as a UUID")
 	}
 }
+
+// TestSignalGroupNameResolver proves group names come from the groups API and
+// are cached across messages. Both the internal_id and the API id resolve to
+// the same display name.
+func TestSignalGroupNameResolver(t *testing.T) {
+	const (
+		account    = "+15555550303"
+		internalID = "FyZ5D/fEjYhE0+7AvLZgAD3w88fRJ08xx1otqxDCVZE="
+		apiID      = "group.RnlaNUQvZkVqWWhFMCs3QXZMWmdBRDN3ODhmUkowOHh4MW90cXhEQ1ZaRT0="
+		name       = "Aether chat"
+	)
+
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if got := r.URL.Path; got != "/v1/groups/"+account {
+			t.Errorf("path = %q, want groups for %s", got, account)
+		}
+		fmt.Fprintf(w, `[{"id":%q,"internal_id":%q,"name":%q}]`, apiID, internalID, name)
+	}))
+	t.Cleanup(srv.Close)
+
+	resolver := newSignalGroupNameResolver(srv.URL, account)
+	if got := resolver.Name(account, "group."+internalID); got != name {
+		t.Fatalf("Name(internal_id) = %q, want %q", got, name)
+	}
+	if got := resolver.Name(account, apiID); got != name {
+		t.Fatalf("Name(api id) = %q, want %q", got, name)
+	}
+	if got := resolver.Name(account, "group.unknown=="); got != "" {
+		t.Fatalf("Name(unknown) = %q, want empty", got)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("groups API calls = %d, want 1 (cached)", got)
+	}
+}

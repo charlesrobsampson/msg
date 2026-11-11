@@ -99,6 +99,11 @@ type SignalJSONRPCWrapper struct {
 // nil elsewhere (tests), which simply disables enrichment.
 var signalSenderNumberLookup func(account, uuid string) string
 
+// signalGroupNameLookup resolves a group conversation ID to its display name.
+// Webhook envelopes usually carry only the opaque group ID, so the groups API
+// is the authoritative source. Nil disables enrichment.
+var signalGroupNameLookup func(account, groupID string) string
+
 // signalDefaultAccount is the configured account, used when a webhook payload
 // omits its own account field.
 var signalDefaultAccount string
@@ -191,6 +196,97 @@ func (r *signalIdentityResolver) refreshLocked(account string) error {
 // sender ids as UUIDs.
 func looksLikeSignalUUID(value string) bool {
 	return len(value) == 36 && strings.Count(value, "-") == 4
+}
+
+// signalGroupNameResolver caches signal-cli's /v1/groups response so a burst of
+// group messages does not trigger one HTTP request each. Groups are keyed by
+// both their internal_id and their API id because webhook envelopes differ in
+// which one they report.
+type signalGroupNameResolver struct {
+	baseURL        string
+	defaultAccount string
+	client         *http.Client
+	ttl            time.Duration
+
+	mu        sync.Mutex
+	names     map[string]string
+	fetchedAt time.Time
+	account   string
+}
+
+func newSignalGroupNameResolver(baseURL, account string) *signalGroupNameResolver {
+	return &signalGroupNameResolver{
+		baseURL:        strings.TrimRight(baseURL, "/"),
+		defaultAccount: account,
+		client:         &http.Client{Timeout: 2 * time.Second},
+		ttl:            5 * time.Minute,
+		names:          make(map[string]string),
+	}
+}
+
+// Name returns groupID's display name, or "" when Signal does not expose one.
+func (r *signalGroupNameResolver) Name(account, groupID string) string {
+	if r == nil || r.baseURL == "" || strings.TrimSpace(groupID) == "" {
+		return ""
+	}
+	if account == "" {
+		account = r.defaultAccount
+	}
+	if account == "" {
+		return ""
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	fresh := r.account == account && time.Since(r.fetchedAt) < r.ttl
+	if !fresh && r.refreshLocked(account) != nil {
+		// Serve the stale cache rather than drop the name entirely.
+		if r.account != account {
+			return ""
+		}
+	}
+	return r.names[normalizeGroupID(groupID)]
+}
+
+// refreshLocked replaces the cache for account. The caller holds r.mu.
+func (r *signalGroupNameResolver) refreshLocked(account string) error {
+	endpoint := fmt.Sprintf("%s/v1/groups/%s", r.baseURL, url.PathEscape(account))
+	resp, err := r.client.Get(endpoint)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("groups: status %d", resp.StatusCode)
+	}
+
+	var groups []struct {
+		ID         string `json:"id"`
+		Name       string `json:"name"`
+		InternalID string `json:"internal_id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&groups); err != nil {
+		return err
+	}
+
+	names := make(map[string]string, len(groups))
+	for _, group := range groups {
+		name := strings.TrimSpace(group.Name)
+		if name == "" {
+			continue
+		}
+		if group.InternalID != "" {
+			names[normalizeGroupID(group.InternalID)] = name
+		}
+		if group.ID != "" {
+			names[normalizeGroupID(group.ID)] = name
+		}
+	}
+	r.names = names
+	r.account = account
+	r.fetchedAt = time.Now()
+	return nil
 }
 
 // Per-account DB cache so a single receiver process can serve all accounts.
@@ -291,6 +387,10 @@ func handleSignalReceiver(args []string) {
 		resolver := newSignalIdentityResolver(signalBaseURL, signalAccount)
 		signalSenderNumberLookup = func(account, uuid string) string {
 			return resolver.Number(account, uuid)
+		}
+		groupResolver := newSignalGroupNameResolver(signalBaseURL, signalAccount)
+		signalGroupNameLookup = func(account, groupID string) string {
+			return groupResolver.Name(account, groupID)
 		}
 	}
 
@@ -554,7 +654,12 @@ func saveSignalPayload(p SignalWebhookPayload) error {
 		}
 		if p.Envelope.DataMessage.GroupInfo != nil && p.Envelope.DataMessage.GroupInfo.GroupID != "" {
 			inbound.GroupID = normalizeGroupID(p.Envelope.DataMessage.GroupInfo.GroupID)
-			inbound.GroupName = p.Envelope.DataMessage.GroupInfo.GroupName
+			inbound.GroupName = strings.TrimSpace(p.Envelope.DataMessage.GroupInfo.GroupName)
+			// Webhook envelopes often carry only the opaque group ID, so fall
+			// back to the groups API for the display name.
+			if inbound.GroupName == "" && signalGroupNameLookup != nil {
+				inbound.GroupName = signalGroupNameLookup(account, inbound.GroupID)
+			}
 		}
 	} else if p.Envelope.SyncMessage != nil && p.Envelope.SyncMessage.SentMessage != nil {
 		sent := p.Envelope.SyncMessage.SentMessage
