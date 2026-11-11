@@ -37,6 +37,18 @@ type signalReactionMessage struct {
 	TargetAuthorNumber  string `json:"targetAuthorNumber"`
 }
 
+// signalMention is one native @mention in a Signal message. signal-cli exposes
+// the target under different field names depending on version/transport, so
+// all of them are accepted.
+type signalMention struct {
+	Number          string `json:"number"`
+	RecipientNumber string `json:"recipientNumber"`
+	Recipient       string `json:"recipient"`
+	Author          string `json:"author"`
+	UUID            string `json:"uuid"`
+	ACI             string `json:"aci"`
+}
+
 type SignalWebhookEnvelope struct {
 	Source       string `json:"source"`
 	SourceNumber string `json:"sourceNumber"`
@@ -48,8 +60,10 @@ type SignalWebhookEnvelope struct {
 		Timestamp       int64                  `json:"timestamp"`
 		Attachments     []signalAttachment     `json:"attachments"`
 		ReactionMessage *signalReactionMessage `json:"reaction"`
+		Mentions        []signalMention        `json:"mentions"`
 		GroupInfo       *struct {
-			GroupID string `json:"groupId"`
+			GroupID   string `json:"groupId"`
+			GroupName string `json:"groupName"`
 		} `json:"groupInfo"`
 	} `json:"dataMessage"`
 	SyncMessage *struct {
@@ -60,7 +74,8 @@ type SignalWebhookEnvelope struct {
 			Attachments     []signalAttachment     `json:"attachments"`
 			ReactionMessage *signalReactionMessage `json:"reaction"`
 			GroupInfo       *struct {
-				GroupID string `json:"groupId"`
+				GroupID   string `json:"groupId"`
+				GroupName string `json:"groupName"`
 			} `json:"groupInfo"`
 		} `json:"sentMessage"`
 	} `json:"syncMessage"`
@@ -83,6 +98,10 @@ type SignalJSONRPCWrapper struct {
 // by handleSignalReceiver when signal-cli's HTTP API is configured and stays
 // nil elsewhere (tests), which simply disables enrichment.
 var signalSenderNumberLookup func(account, uuid string) string
+
+// signalDefaultAccount is the configured account, used when a webhook payload
+// omits its own account field.
+var signalDefaultAccount string
 
 // signalIdentityResolver caches signal-cli's /v1/identities response so a
 // message flood does not trigger one HTTP request per sender. Unknown UUIDs
@@ -264,6 +283,7 @@ func handleSignalReceiver(args []string) {
 	if signalAccount == "" {
 		signalAccount = os.Getenv("SIGNAL_ACCOUNT")
 	}
+	signalDefaultAccount = signalAccount
 
 	// Resolve UUID-only senders to their phone number when signal-cli knows
 	// one. The identities endpoint is the authoritative source and is cached.
@@ -388,6 +408,50 @@ func normalizeGroupID(id string) string {
 	return "group." + id
 }
 
+// signalMentionsMe reports whether any native mention targets account. Signal
+// renders the mention itself as an invisible placeholder, so this flag is what
+// lets Aether enforce group @mention gating.
+func signalMentionsMe(mentions []signalMention, account string) bool {
+	account = strings.TrimSpace(account)
+	if account == "" {
+		return false
+	}
+	for _, mention := range mentions {
+		for _, target := range []string{
+			mention.Number,
+			mention.RecipientNumber,
+			mention.Recipient,
+			mention.Author,
+			mention.UUID,
+			mention.ACI,
+		} {
+			if sameSignalAddress(target, account) {
+				return true
+			}
+		}
+		// Some signal-cli versions expose only the mention's UUID. Resolve it
+		// through the same identities cache used for UUID-only senders.
+		if mention.UUID != "" && signalSenderNumberLookup != nil {
+			if number := signalSenderNumberLookup(account, mention.UUID); sameSignalAddress(number, account) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func sameSignalAddress(a, b string) bool {
+	a = strings.TrimSpace(a)
+	b = strings.TrimSpace(b)
+	if a == "" || b == "" {
+		return false
+	}
+	if strings.HasPrefix(a, "+") || strings.HasPrefix(b, "+") {
+		return a == b
+	}
+	return strings.EqualFold(a, b)
+}
+
 // saveSignalPayload extracts and persists a message from a webhook/WebSocket payload.
 func saveSignalPayload(p SignalWebhookPayload) error {
 	db := dbForAccount(p.Account)
@@ -474,6 +538,10 @@ func saveSignalPayload(p SignalWebhookPayload) error {
 			TimestampMS:  ts,
 		}
 
+		account := strings.TrimSpace(p.Account)
+		if account == "" {
+			account = signalDefaultAccount
+		}
 		inbound = &ForwardMessage{
 			Sender:       forwardSender,
 			Text:         p.Envelope.DataMessage.Message,
@@ -482,9 +550,11 @@ func saveSignalPayload(p SignalWebhookPayload) error {
 			SenderName:   p.Envelope.SourceName,
 			SenderNumber: senderNumber,
 			TimestampMS:  msg.TimestampMS,
+			MentionsMe:   signalMentionsMe(p.Envelope.DataMessage.Mentions, account),
 		}
 		if p.Envelope.DataMessage.GroupInfo != nil && p.Envelope.DataMessage.GroupInfo.GroupID != "" {
 			inbound.GroupID = normalizeGroupID(p.Envelope.DataMessage.GroupInfo.GroupID)
+			inbound.GroupName = p.Envelope.DataMessage.GroupInfo.GroupName
 		}
 	} else if p.Envelope.SyncMessage != nil && p.Envelope.SyncMessage.SentMessage != nil {
 		sent := p.Envelope.SyncMessage.SentMessage

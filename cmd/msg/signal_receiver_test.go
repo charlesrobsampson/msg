@@ -90,6 +90,38 @@ func TestSignalIdentityResolverKeepsCacheOnFailure(t *testing.T) {
 	}
 }
 
+// TestSignalMentionsMe covers the native mention formats signal-cli exposes.
+// The account is matched by phone or UUID, and an unrelated mention is ignored.
+func TestSignalMentionsMe(t *testing.T) {
+	const (
+		account = "+15555550100"
+		uuid    = "b9e8dd13-2ab7-4ced-9375-822dc29e548f"
+	)
+
+	if !signalMentionsMe([]signalMention{{Author: account}}, account) {
+		t.Error("phone author mention was not detected")
+	}
+	if !signalMentionsMe([]signalMention{{UUID: uuid}}, uuid) {
+		t.Error("UUID mention was not detected")
+	}
+	if signalMentionsMe([]signalMention{{Author: "+15555550199"}}, account) {
+		t.Error("unrelated mention was treated as the account")
+	}
+
+	previous := signalSenderNumberLookup
+	signalSenderNumberLookup = func(gotAccount, gotUUID string) string {
+		if gotAccount == account && gotUUID == uuid {
+			return account
+		}
+		return ""
+	}
+	t.Cleanup(func() { signalSenderNumberLookup = previous })
+
+	if !signalMentionsMe([]signalMention{{UUID: uuid}}, account) {
+		t.Error("UUID mention was not resolved to the account phone")
+	}
+}
+
 func TestLooksLikeSignalUUID(t *testing.T) {
 	if !looksLikeSignalUUID("2aea5c40-0f8e-4ad7-8099-880b50064454") {
 		t.Error("valid UUID was not recognised")

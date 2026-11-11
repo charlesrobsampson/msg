@@ -583,6 +583,70 @@ func TestSignalWebhookPrefersSourceNumber(t *testing.T) {
 	}
 }
 
+// TestSignalWebhookForwardsGroupMention proves group metadata and native
+// mention detection reach Aether, which needs both to gate group responses.
+func TestSignalWebhookForwardsGroupMention(t *testing.T) {
+	const (
+		account   = "+15555550305"
+		phone     = "+18018335931"
+		groupID   = "FyZ5D/fEjYhE0+7AvLZgAD3w88fRJ08xx1otqxDCVZE="
+		groupName = "Sailing Crew"
+	)
+
+	t.Setenv("AETHER_INGRESS_TOKEN", "")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	arrived := make(chan ForwardMessage, 1)
+	forwardSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var msg ForwardMessage
+		if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
+			t.Errorf("decoding forwarded body: %v", err)
+		}
+		arrived <- msg
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	t.Cleanup(forwardSrv.Close)
+	writeForwardingConfig(t, home, "config.json", account, true, forwardSrv.URL)
+	swapForwardQueue(t, defaultForwardQueueDepth)
+	if dbForAccount(account) == nil {
+		t.Fatal("could not open the profile DB")
+	}
+
+	webhook := httptest.NewServer(newWebhookHandler(saveSignalPayload))
+	defer webhook.Close()
+
+	ts := int64(1700000000700)
+	body := fmt.Sprintf(`{"account":%q,"envelope":{"source":%q,"sourceNumber":%q,"sourceName":"Charles Sampson","timestamp":%d,"dataMessage":{"message":"\uFFFC !help","timestamp":%d,"mentions":[{"author":%q}],"groupInfo":{"groupId":%q,"groupName":%q}}}}`,
+		account, phone, phone, ts, ts, account, groupID, groupName)
+	resp, err := http.Post(webhook.URL, "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("post webhook: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("webhook status = %d, want 200", resp.StatusCode)
+	}
+
+	select {
+	case got := <-arrived:
+		if got.GroupID != "group."+groupID {
+			t.Errorf("GroupID = %q, want group.%s", got.GroupID, groupID)
+		}
+		if got.GroupName != groupName {
+			t.Errorf("GroupName = %q, want %q", got.GroupName, groupName)
+		}
+		if !got.MentionsMe {
+			t.Error("MentionsMe = false, want true")
+		}
+		if got.Text != "\uFFFC !help" {
+			t.Errorf("Text = %q, want the native mention placeholder preserved", got.Text)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("forward never reached the fake Aether")
+	}
+}
+
 // TestSignalWebhookResolvesMissingSourceNumber proves a UUID-only envelope is
 // enriched from signal-cli's identities cache before forwarding, so Aether
 // authorizes the phone number a maintainer knows.

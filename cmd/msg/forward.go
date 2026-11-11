@@ -34,6 +34,8 @@ type ForwardMessage struct {
 	Text         string `json:"text"`
 	Provider     string `json:"provider,omitempty"`
 	GroupID      string `json:"group_id,omitempty"`
+	GroupName    string `json:"group_name,omitempty"`
+	MentionsMe   bool   `json:"mentions_me,omitempty"`
 	MessageID    string `json:"message_id,omitempty"`
 	SenderName   string `json:"sender_name,omitempty"`
 	SenderNumber string `json:"sender_number,omitempty"`
