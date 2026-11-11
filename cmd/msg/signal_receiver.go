@@ -79,6 +79,101 @@ type SignalJSONRPCWrapper struct {
 	Params  *SignalWebhookPayload `json:"params"`
 }
 
+// signalSenderNumberLookup resolves a Signal UUID to a phone number. It is set
+// by handleSignalReceiver when signal-cli's HTTP API is configured and stays
+// nil elsewhere (tests), which simply disables enrichment.
+var signalSenderNumberLookup func(account, uuid string) string
+
+// signalIdentityResolver caches signal-cli's /v1/identities response so a
+// message flood does not trigger one HTTP request per sender. Unknown UUIDs
+// are cached as misses until the next refresh.
+type signalIdentityResolver struct {
+	baseURL        string
+	defaultAccount string
+	client         *http.Client
+	ttl            time.Duration
+
+	mu        sync.Mutex
+	numbers   map[string]string
+	fetchedAt time.Time
+	account   string
+}
+
+func newSignalIdentityResolver(baseURL, account string) *signalIdentityResolver {
+	return &signalIdentityResolver{
+		baseURL:        strings.TrimRight(baseURL, "/"),
+		defaultAccount: account,
+		client:         &http.Client{Timeout: 2 * time.Second},
+		ttl:            5 * time.Minute,
+		numbers:        make(map[string]string),
+	}
+}
+
+// Number returns uuid's phone number, or "" when Signal does not expose one.
+func (r *signalIdentityResolver) Number(account, uuid string) string {
+	if r == nil || r.baseURL == "" || uuid == "" {
+		return ""
+	}
+	if account == "" {
+		account = r.defaultAccount
+	}
+	if account == "" {
+		return ""
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	fresh := r.account == account && time.Since(r.fetchedAt) < r.ttl
+	if !fresh && r.refreshLocked(account) != nil {
+		// Serve the stale cache rather than fail the sender entirely.
+		if r.account != account {
+			return ""
+		}
+	}
+	return r.numbers[uuid]
+}
+
+// refreshLocked replaces the cache for account. The caller holds r.mu.
+func (r *signalIdentityResolver) refreshLocked(account string) error {
+	endpoint := fmt.Sprintf("%s/v1/identities/%s", r.baseURL, url.PathEscape(account))
+	resp, err := r.client.Get(endpoint)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("identities: status %d", resp.StatusCode)
+	}
+
+	var identities []struct {
+		Number string `json:"number"`
+		UUID   string `json:"uuid"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&identities); err != nil {
+		return err
+	}
+
+	numbers := make(map[string]string, len(identities))
+	for _, identity := range identities {
+		number := strings.TrimSpace(identity.Number)
+		uuid := strings.TrimSpace(identity.UUID)
+		if number != "" && uuid != "" {
+			numbers[uuid] = number
+		}
+	}
+	r.numbers = numbers
+	r.account = account
+	r.fetchedAt = time.Now()
+	return nil
+}
+
+// looksLikeSignalUUID keeps the resolver from treating arbitrary opaque
+// sender ids as UUIDs.
+func looksLikeSignalUUID(value string) bool {
+	return len(value) == 36 && strings.Count(value, "-") == 4
+}
+
 // Per-account DB cache so a single receiver process can serve all accounts.
 var (
 	dbCacheMu sync.Mutex
@@ -168,6 +263,15 @@ func handleSignalReceiver(args []string) {
 	}
 	if signalAccount == "" {
 		signalAccount = os.Getenv("SIGNAL_ACCOUNT")
+	}
+
+	// Resolve UUID-only senders to their phone number when signal-cli knows
+	// one. The identities endpoint is the authoritative source and is cached.
+	if signalBaseURL != "" {
+		resolver := newSignalIdentityResolver(signalBaseURL, signalAccount)
+		signalSenderNumberLookup = func(account, uuid string) string {
+			return resolver.Number(account, uuid)
+		}
 	}
 
 	// Warm the active account's DB so pending forwards are replayed at startup,
@@ -332,6 +436,23 @@ func saveSignalPayload(p SignalWebhookPayload) error {
 			convID = normalizeGroupID(p.Envelope.DataMessage.GroupInfo.GroupID)
 		}
 
+		// Signal's envelope often omits sourceNumber when the sender hides
+		// their number. Ask signal-cli's identities cache in that case so
+		// Aether authorizes the phone a maintainer recognises. The original
+		// source still keys the message and conversation, which keeps the
+		// existing msg history intact.
+		senderNumber := strings.TrimSpace(p.Envelope.SourceNumber)
+		if senderNumber == "" && strings.HasPrefix(source, "+") {
+			senderNumber = source
+		}
+		if senderNumber == "" && looksLikeSignalUUID(source) && signalSenderNumberLookup != nil {
+			senderNumber = signalSenderNumberLookup(p.Account, source)
+		}
+		forwardSender := source
+		if senderNumber != "" {
+			forwardSender = senderNumber
+		}
+
 		ts := p.Envelope.DataMessage.Timestamp
 		if ts == 0 {
 			ts = p.Envelope.Timestamp
@@ -347,18 +468,14 @@ func saveSignalPayload(p SignalWebhookPayload) error {
 		msg = client.Message{
 			MessageID:    fmt.Sprintf("rcv-%d-%s", ts, source),
 			SenderName:   p.Envelope.SourceName,
-			SenderNumber: source, // resolved: SourceNumber → Source → SourceUUID
+			SenderNumber: forwardSender,
 			Body:         p.Envelope.DataMessage.Message,
 			IsFromMe:     false,
 			TimestampMS:  ts,
 		}
 
-		senderNumber := p.Envelope.SourceNumber
-		if senderNumber == "" && strings.HasPrefix(source, "+") {
-			senderNumber = source
-		}
 		inbound = &ForwardMessage{
-			Sender:       source,
+			Sender:       forwardSender,
 			Text:         p.Envelope.DataMessage.Message,
 			Provider:     "signal",
 			MessageID:    msg.MessageID,
